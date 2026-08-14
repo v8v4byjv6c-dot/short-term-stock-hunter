@@ -1,249 +1,282 @@
 
-import streamlit as st
-import pandas as pd
+import io
+import re
+from urllib.parse import urljoin
 import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="短期上昇株ハンター", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="短期上昇株ハンター", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
+JPX_LIST_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
 
-# ---------- utilities ----------
-def tick_size(p):
-    if p < 3000: return 1
-    if p < 5000: return 5
-    if p < 10000: return 10
-    if p < 30000: return 30
-    if p < 50000: return 50
-    if p < 100000: return 100
+st.markdown("""
+<style>
+.block-container {max-width: 1280px; padding-top: 1rem; padding-bottom: 3rem;}
+h1,h2,h3 {letter-spacing:-0.02em;}
+</style>
+""", unsafe_allow_html=True)
+
+def tick_size(price):
+    if price < 3000: return 1
+    if price < 5000: return 5
+    if price < 10000: return 10
+    if price < 30000: return 10
+    if price < 50000: return 50
+    if price < 100000: return 100
     return 100
 
-def yen(x):
-    return "-" if pd.isna(x) else f"{x:,.0f}円"
+def mark(v): return "🟢" if bool(v) else "－"
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_tse_universe():
+    headers={"User-Agent":"Mozilla/5.0"}
+    r=requests.get(JPX_LIST_PAGE,headers=headers,timeout=30); r.raise_for_status()
+    hrefs=re.findall(r'href=["\']([^"\']+\.(?:xlsx?|XLSX?))["\']',r.text)
+    if not hrefs: raise RuntimeError("JPXの上場銘柄一覧Excelが見つかりません。")
+    preferred=[h for h in hrefs if "data_j" in h.lower()]
+    url=urljoin(JPX_LIST_PAGE,(preferred or hrefs)[0])
+    x=requests.get(url,headers=headers,timeout=60); x.raise_for_status()
+    df=pd.read_excel(io.BytesIO(x.content),sheet_name=0)
+    code_col=next((c for c in df.columns if "コード" in str(c)),None)
+    name_col=next((c for c in df.columns if "銘柄名" in str(c) or "会社名" in str(c)),None)
+    market_col=next((c for c in df.columns if "市場・商品区分" in str(c) or "市場区分" in str(c)),None)
+    sector_col=next((c for c in df.columns if "33業種" in str(c) or "業種区分" in str(c)),None)
+    if code_col is None or name_col is None: raise RuntimeError("JPX Excelの列構成を認識できません。")
+    u=pd.DataFrame({
+        "コード":df[code_col].astype(str).str.strip().str.upper(),
+        "銘柄名":df[name_col].astype(str).str.strip(),
+        "市場":df[market_col].astype(str).str.strip() if market_col is not None else "",
+        "業種":df[sector_col].astype(str).str.strip() if sector_col is not None else "",
+    })
+    u["コード"]=u["コード"].str.extract(r"([0-9A-Z]{4})",expand=False)
+    u=u.dropna(subset=["コード"]).drop_duplicates("コード")
+    if market_col is not None:
+        domestic=(u["市場"].str.contains("プライム",na=False)|u["市場"].str.contains("スタンダード",na=False)|u["市場"].str.contains("グロース",na=False))
+        non_common=u["市場"].str.contains(r"ETF|ETN|REIT|投資法人|インフラ|出資証券|優先出資|外国",case=False,regex=True,na=False)
+        u=u[domestic & ~non_common].copy()
+    u["ticker"]=u["コード"]+".T"
+    u["銘柄"]=u["コード"]+" "+u["銘柄名"]
+    u["Yahoo!チャート"]="https://finance.yahoo.co.jp/quote/"+u["ticker"]+"/chart"
+    return u.reset_index(drop=True)
 
 @st.cache_data(ttl=900, show_spinner=False)
-def prices(ticker, period="1y"):
-    d=yf.download(ticker, period=period, interval="1d", auto_adjust=False,
-                  progress=False, threads=False)
-    if d is None or d.empty: return pd.DataFrame()
-    if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
-    cols=[c for c in ["Open","High","Low","Close","Volume"] if c in d.columns]
-    return d[cols].dropna()
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fundamentals(ticker):
-    # Yahoo Financeの四半期データ。取得できない場合はCを「判定不能」にする。
-    try:
-        y=yf.Ticker(ticker)
-        q=y.quarterly_financials
-        if q is None or q.empty: return {}
-        # 行名はYahoo側の表示変更に備えて候補を探す
-        def row(names):
-            for n in names:
-                if n in q.index: return q.loc[n]
-            return None
-        rev=row(["Total Revenue","Operating Revenue"])
-        op=row(["Operating Income"])
-        if rev is None or op is None or len(rev)<2 or len(op)<2: return {}
-        rev=pd.to_numeric(rev,errors="coerce").dropna()
-        op=pd.to_numeric(op,errors="coerce").dropna()
-        if len(rev)<2 or len(op)<2: return {}
-        # 最新四半期 vs 前四半期ではなく、取得できる範囲で直前期比を参考値として使う
-        r_growth=(float(rev.iloc[0])/float(rev.iloc[1])-1)*100 if rev.iloc[1] else np.nan
-        o_growth=(float(op.iloc[0])/float(op.iloc[1])-1)*100 if op.iloc[1] else np.nan
-        return {"revenue_growth":r_growth,"op_growth":o_growth}
-    except Exception:
-        return {}
-
-def analyze(ticker, max_dev=5, slope_days=20, breakout_days=60):
-    d=prices(ticker)
-    if len(d)<100: return None
-    d["MA25"]=d.Close.rolling(25).mean()
-    d["MA75"]=d.Close.rolling(75).mean()
-    d["MA75prev"]=d.MA75.shift(slope_days)
-    d["Dev75"]=(d.Close/d.MA75-1)*100
-    d["Ret20"]=d.Close.pct_change(20)*100
-    d["Ret60"]=d.Close.pct_change(60)*100
-    d["High60"]=d.High.shift(1).rolling(breakout_days).max()
-    d["Vol20"]=d.Volume.rolling(20).mean()
-    d["VolRatio"]=d.Volume/d.Vol20
-
-    x=d.iloc[-1]; p=d.iloc[-2]
-    close=float(x.Close); high=float(x.High); low=float(x.Low)
-    ma25=float(x.MA25); ma75=float(x.MA75)
-    slope=(ma75/float(x.MA75prev)-1)*100
-    dev=float(x.Dev75); ret20=float(x.Ret20); ret60=float(x.Ret60)
-    volratio=float(x.VolRatio) if np.isfinite(x.VolRatio) else 0
-    high60=float(x.High60) if np.isfinite(x.High60) else np.nan
-
-    # A: 75日線押し目
-    A=(slope>0 and -max_dev<=dev<=2.0)
-    # 75日線付近で下から回復した/反転した
-    crossed=(float(p.Close)<=float(p.MA75) and close>ma75)
-    near_rebound=(dev<=0 and close>float(p.Close) and close>float(p.Open))
-    A_score=min(100,max(0,50+slope*8-abs(dev)*8+(25 if crossed else 0)+(10 if near_rebound else 0)))
-
-    # B: 60日高値ブレイク＋出来高増加＋トレンド
-    B=(np.isfinite(high60) and close>high60 and volratio>=1.3 and slope>0)
-    B_score=min(100,max(0,(ret20*3)+(volratio-1)*30+(30 if B else 0)))
-
-    # C: 決算モメンタム（Yahooの四半期財務が取れた場合のみ）
-    f=fundamentals(ticker)
-    rg=f.get("revenue_growth",np.nan); og=f.get("op_growth",np.nan)
-    C=bool(np.isfinite(og) and og>=20 and (not np.isfinite(rg) or rg>=0))
-    C_score=(min(100,max(0,og*1.5)) if np.isfinite(og) else 0)
-
-    # D: 強いモメンタム→調整→再上昇
-    # 60日で上昇、現在は25日線近辺/75日線上、直近5日で反発
-    ret5=float(d.Close.pct_change(5).iloc[-1])*100
-    pullback=(ret60>=10 and close<=float(d.Close.tail(20).max())*0.97)
-    rebound=(ret5>0 and close>ma25)
-    D=(ret60>=10 and pullback and rebound and slope>0)
-    D_score=min(100,max(0,ret60*2+ret5*4+(25 if D else 0)))
-
-    # 買い価格：Aは75日線上抜け、B/Dは直近高値/当日高値の1ティック上
-    if A and close<=ma75:
-        buy=ma75+tick_size(ma75); setup="A 75日線上抜け待ち"
-    elif B:
-        buy=high+tick_size(high); setup="B ブレイクアウト"
-    elif D:
-        buy=high+tick_size(high); setup="D モメンタム再上昇"
-    else:
-        buy=ma75+tick_size(ma75); setup="監視"
-
-    stop=buy*0.98
-    target=buy+(buy-stop)*2
-    hits=sum([A,B,C,D])
-    total=0.30*A_score+0.25*B_score+0.20*C_score+0.25*D_score + hits*5
-
-    if hits>=3: verdict="🔥 最優先"
-    elif hits>=2: verdict="🟢 強候補"
-    elif A or B or C or D: verdict="🟡 候補"
-    else: verdict="⚪ 見送り"
-
-    return {
-        "コード":ticker.replace(".T",""),"株価":close,"75日線":ma75,
-        "75日線傾き%":slope,"75日線乖離%":dev,
-        "A 75日線押し目":"🟢" if A else "－",
-        "B ブレイク":"🟢" if B else "－",
-        "C 決算モメンタム":"🟢" if C else "－",
-        "D モメンタム押し目":"🟢" if D else "－",
-        "買い価格":buy,"損切り目安":stop,"利確目安(2R)":target,
-        "総合スコア":total,"判定":verdict,"買いセットアップ":setup,
-        "営業利益成長率%":og
-    }
-
-# ---------- UI ----------
-st.title("🎯 短期上昇株ハンター")
-st.caption("A〜Dの4戦略で日本株をスクリーニング。買い価格まで自動計算。")
-
-with st.sidebar:
-    st.header("A：75日線押し目")
-    max_dev=st.slider("75日線からの許容乖離（%）",1.0,10.0,5.0,0.5)
-    slope_days=st.slider("75日線の傾きを見る期間",5,40,20)
-    st.header("B：ブレイクアウト")
-    breakout_days=st.slider("高値更新判定期間（日）",20,120,60,10)
-    st.header("リスク管理")
-    stop_pct=st.slider("損切り目安（%）",0.5,10.0,2.0,0.5)
-    period=st.selectbox("株価取得期間",["6mo","1y","2y"],index=1)
-    st.caption("CはYahoo Financeで四半期財務が取得できる場合のみ判定します。決算サプライズ（市場予想比）は別途データが必要です。")
-
-default="""8343
-8306
-8316
-8411
-8591
-8604
-8331
-8354
-8366
-8377
-8385
-1301
-1332
-1605
-1925
-1928
-2914
-3382
-3402
-4063
-4502
-4503
-4568
-5401
-6501
-6758
-6861
-6902
-7011
-7203
-7267
-7741
-7974
-8001
-8031
-8058
-8766
-8801
-8802
-9020
-9021
-9022
-9432
-9433
-9434
-9501
-9503
-9531
-9983
-9984"""
-
-txt=st.text_area("監視銘柄（東証コードを1行1銘柄）",default,height=230)
-tickers=[]
-for s in txt.splitlines():
-    s=s.strip().upper()
-    if not s: continue
-    if s.isdigit(): s=s.zfill(4)+".T"
-    tickers.append(s)
-
-if st.button("🚀 4戦略でスクリーニング",type="primary",use_container_width=True):
-    rows=[]; prog=st.progress(0)
-    for i,t in enumerate(tickers):
+def download_batch(tickers,period):
+    out={}
+    tickers=list(tickers)
+    for s in range(0,len(tickers),100):
+        chunk=tickers[s:s+100]
         try:
-            r=analyze(t,max_dev,slope_days,breakout_days)
-            if r: rows.append(r)
+            d=yf.download(chunk,period=period,interval="1d",group_by="ticker",auto_adjust=False,progress=False,threads=True)
+            if d is None or d.empty: continue
+            if len(chunk)==1 and not isinstance(d.columns,pd.MultiIndex):
+                out[chunk[0]]=d.copy()
+            elif isinstance(d.columns,pd.MultiIndex):
+                l0=set(d.columns.get_level_values(0)); l1=set(d.columns.get_level_values(1))
+                if any(t in l0 for t in chunk):
+                    for t in chunk:
+                        if t in l0:
+                            x=d[t].dropna(how="all")
+                            if not x.empty: out[t]=x
+                else:
+                    for t in chunk:
+                        if t in l1:
+                            x=d.xs(t,axis=1,level=1).dropna(how="all")
+                            if not x.empty: out[t]=x
         except Exception:
             pass
-        prog.progress((i+1)/max(1,len(tickers)))
-    prog.empty()
+    return out
 
-    if rows:
-        df=pd.DataFrame(rows).sort_values("総合スコア",ascending=False)
-        st.subheader("🏆 総合ランキング")
-        cols=["コード","株価","75日線","75日線傾き%","75日線乖離%",
-              "A 75日線押し目","B ブレイク","C 決算モメンタム","D モメンタム押し目",
-              "買い価格","損切り目安","利確目安(2R)","総合スコア","判定"]
-        st.dataframe(df[cols].style.format({
-            "株価":yen,"75日線":yen,"買い価格":yen,"損切り目安":yen,"利確目安(2R)":yen,
-            "75日線傾き%":"{:+.2f}","75日線乖離%":"{:+.2f}","総合スコア":"{:.1f}"
-        }),use_container_width=True,hide_index=True)
+def technical_scan(d,slope_days,max_dev,breakout_days,a_stop_buffer_pct,buy_ticks):
+    if d is None or d.empty: return None
+    if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
+    need=["Open","High","Low","Close","Volume"]
+    if not all(c in d.columns for c in need): return None
+    d=d[need].dropna()
+    if len(d)<max(100,75+slope_days+2,breakout_days+2): return None
+    d["MA25"]=d.Close.rolling(25).mean(); d["MA75"]=d.Close.rolling(75).mean()
+    d["OLD"]=d.MA75.shift(slope_days); d["DEV"]=(d.Close/d.MA75-1)*100
+    d["R5"]=d.Close.pct_change(5)*100; d["R20"]=d.Close.pct_change(20)*100; d["R60"]=d.Close.pct_change(60)*100
+    d["BH"]=d.High.shift(1).rolling(breakout_days).max()
+    d["V20"]=d.Volume.rolling(20).mean(); d["VR"]=d.Volume/d.V20
+    x=d.iloc[-1]; p=d.iloc[-2]
+    vals=[x.Close,x.High,x.MA25,x.MA75,x.OLD,x.DEV,x.R5,x.R20,x.R60]
+    if not all(np.isfinite(float(v)) for v in vals): return None
+    close=float(x.Close); high=float(x.High); ma25=float(x.MA25); ma75=float(x.MA75)
+    slope=(ma75/float(x.OLD)-1)*100; dev=float(x.DEV); r5=float(x.R5); r20=float(x.R20); r60=float(x.R60)
+    vr=float(x.VR) if np.isfinite(x.VR) else 0; bh=float(x.BH) if np.isfinite(x.BH) else np.nan
 
-        st.subheader("🔎 戦略別")
-        tabs=st.tabs(["A 押し目","B ブレイク","C 決算","D モメンタム押し目"])
-        checks=[
-            df["A 75日線押し目"]=="🟢",
-            df["B ブレイク"]=="🟢",
-            df["C 決算モメンタム"]=="🟢",
-            df["D モメンタム押し目"]=="🟢"
-        ]
-        for tab,mask in zip(tabs,checks):
-            with tab:
-                st.dataframe(df[mask][cols],use_container_width=True,hide_index=True)
-        st.subheader("💰 買い価格について")
-        st.info("Aは75日線上抜け＋1ティック、B/Dは当日高値＋1ティックを基本値として表示。損切りは現在2%の暫定値。")
-        csv=df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("CSV保存",csv,"short_term_stock_hunter.csv","text/csv")
-    else:
-        st.error("データを取得できる銘柄がありませんでした。")
+    trend=slope>0; near=(-max_dev<=dev<=2.0)
+    crossed=np.isfinite(float(p.MA75)) and float(p.Close)<=float(p.MA75) and close>ma75
+    bullish=close>float(p.Close) and close>float(x.Open)
+    A=trend and near
+    dist=max(0,100-abs(dev)/max(max_dev,0.1)*100); sl=min(100,max(0,slope/5*100))
+    As=min(100,max(0,0.50*dist+0.35*sl+15*crossed+8*bullish))
+    a_buy=ma75+tick_size(ma75)*buy_ticks
+    a_stop=ma75*(1-a_stop_buffer_pct/100)
+
+    B=bool(trend and np.isfinite(bh) and close>bh and vr>=1.3)
+    Bs=min(100,max(0,min(45,max(0,r20*2))+min(30,max(0,(vr-1)*30))+(25 if B else 0)))
+
+    recent=float(d.Close.tail(20).max()); dd=(close/recent-1)*100
+    D=bool(trend and r60>=10 and dd<=-3 and r5>0 and close>ma25)
+    Ds=min(100,max(0,min(45,max(0,r60*1.5))+min(25,max(0,r5*4))+(30 if D else 0)))
+    bd_buy=high+tick_size(high)
+
+    return {"株価":close,"75日線":ma75,"75日線_比較期間前比%":slope,"75日線_乖離率%":dev,
+            "出来高_20日平均比":vr,"20日騰落率%":r20,"60日騰落率%":r60,
+            "A":A,"Aスコア":As,"A買い価格":a_buy,"A初期損切り":a_stop,
+            "B":B,"Bスコア":Bs,"B買い価格":bd_buy,
+            "D":D,"Dスコア":Ds,"D買い価格":bd_buy}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def financial_momentum(ticker):
+    try:
+        q=yf.Ticker(ticker).quarterly_financials
+        if q is None or q.empty:return {}
+        def pick(names):
+            for n in names:
+                if n in q.index:return pd.to_numeric(q.loc[n],errors="coerce").dropna()
+            return pd.Series(dtype=float)
+        op=pick(["Operating Income"]); rev=pick(["Total Revenue","Operating Revenue"])
+        if len(op)<5:return {}
+        op_now,op_yoy=float(op.iloc[0]),float(op.iloc[4])
+        og=(op_now/op_yoy-1)*100 if op_yoy>0 else np.nan
+        rg=np.nan
+        if len(rev)>=5 and float(rev.iloc[4])!=0: rg=(float(rev.iloc[0])/float(rev.iloc[4])-1)*100
+        C=bool(np.isfinite(og) and og>=20 and (not np.isfinite(rg) or rg>=0))
+        Cs=min(100,(min(70,max(0,og)) if np.isfinite(og) else 0)+(min(30,max(0,rg*2)) if np.isfinite(rg) else 0))
+        return {"C":C,"Cスコア":Cs,"営業利益_前年同期比%":og,"売上高_前年同期比%":rg}
+    except Exception:return {}
+
+st.title("🎯 短期上昇株ハンター")
+st.write("東証の対象銘柄を**自動取得**し、4つの戦略（A〜D）で判定して短期上昇候補をランキングします。監視銘柄の入力は不要です。")
+
+with st.expander("📘 A・B・C・Dとは？ ランキングの仕組み"):
+    st.markdown("""
+**A｜75日線押し目**  
+75日線が上向きで、株価が75日線近辺まで調整した銘柄を狙います。75日線上抜けを買いトリガーとし、再度75日線を明確に割る水準を初期損切りの目安にします。
+
+**B｜ブレイクアウト**  
+75日線が上向きで、過去一定期間の高値を更新し、出来高も増えている銘柄を評価します。
+
+**C｜決算モメンタム**  
+四半期営業利益が前年同期比+20%以上で、売上高が取得できる場合は減収でない銘柄を評価します。現在はYahoo Financeで取得できる四半期財務による暫定ロジックで、市場予想比の決算サプライズは含みません。
+
+**D｜モメンタム＋押し目**  
+直近60日で強く上昇した銘柄が、いったん調整した後に短期的に再上昇している状態を評価します。
+
+**🏆 総合ランキング**  
+A 30%・B 25%・C 20%・D 25%のスコアを合成し、複数戦略に同時該当する銘柄を追加加点します。異なる理由で強さが重なる銘柄を上位にします。
+
+**💰 買い価格・損切り**  
+Aは75日線上抜け、B/Dは当日高値更新を買いトリガーにします。Aの初期損切りは、参考書の考え方に沿って「75日線を再度明確に割る水準」を基準にします。
+""")
+
+with st.sidebar:
+    st.header("スクリーニング設定")
+    pl=st.selectbox("株価をさかのぼる期間",["6か月","1年","2年"],index=1,help="計算に使う過去株価データの長さです。")
+    period={"6か月":"6mo","1年":"1y","2年":"2y"}[pl]
+    slope_days=st.slider("75日線が上向きかを判断する期間",5,40,20,1,help="20なら、現在の75日線が20営業日前より高いかを判定します。")
+    max_dev=st.slider("A：75日線から下に離れてよい範囲",1.0,10.0,5.0,0.5,help="5%なら75日線から-5%より下はA候補から外します。")
+    buy_ticks=st.slider("A：75日線を何ティック上抜けたら買い候補か",1,5,2,1,help="参考書の例を踏まえ初期値は2ティックです。")
+    a_stop_buffer_pct=st.slider("A：75日線割れの損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%",help="75日線をわずかに割っただけのノイズを避けるための参考設定です。")
+    breakout_days=st.slider("B：何日間の高値更新を見るか",20,120,60,10)
+    c_check_count=st.slider("C：決算を詳しく確認する上位銘柄数",30,200,100,10,help="全銘柄の財務取得は重いため、A/B/D上位だけCを確認します。")
+
+try:
+    universe=get_tse_universe()
+except Exception as e:
+    st.error(f"東証銘柄一覧を取得できませんでした：{e}"); st.stop()
+
+m1,m2,m3=st.columns(3)
+m1.metric("自動スキャン対象",f"{len(universe):,}銘柄"); m2.metric("銘柄入力","不要"); m3.metric("対象","東証普通株式中心")
+st.caption("JPX公式の東証上場銘柄一覧を基に、プライム・スタンダード・グロースの普通株式中心に自動取得します。")
+
+if st.button("🚀 今日の候補を自動ランキング",type="primary",use_container_width=True):
+    status=st.empty(); progress=st.progress(0)
+    status.info("① 株価データをまとめて取得しています…")
+    data=download_batch(universe.ticker.tolist(),period)
+    rows=[]; total=len(universe)
+    for i,row in universe.iterrows():
+        d=data.get(row.ticker)
+        if d is not None:
+            r=technical_scan(d,slope_days,max_dev,breakout_days,a_stop_buffer_pct,buy_ticks)
+            if r:
+                r.update({"ticker":row.ticker,"コード":row["コード"],"銘柄名":row["銘柄名"],"銘柄":row["銘柄"],"市場":row["市場"],"業種":row["業種"],"Yahoo!チャート":row["Yahoo!チャート"]})
+                rows.append(r)
+        if i%30==0: progress.progress(min(.70,(i+1)/max(total,1)*.70))
+    if not rows:
+        status.error("株価データを取得できませんでした。"); st.stop()
+
+    tech=pd.DataFrame(rows)
+    tech["テクニカル仮スコア"]=tech.Aスコア*.375+tech.Bスコア*.3125+tech.Dスコア*.3125
+    tech=tech.sort_values("テクニカル仮スコア",ascending=False).reset_index(drop=True)
+
+    status.info("② 上位候補の決算モメンタム（C）を確認しています…")
+    n=min(c_check_count,len(tech)); cmap={}
+    for j,t in enumerate(tech.head(n).ticker):
+        cmap[t]=financial_momentum(t); progress.progress(.70+(j+1)/max(n,1)*.30)
+    progress.empty(); status.success("ランキングを作成しました。")
+
+    tech["C"]=[cmap.get(t,{}).get("C",False) for t in tech.ticker]
+    tech["Cスコア"]=[cmap.get(t,{}).get("Cスコア",0) for t in tech.ticker]
+    tech["営業利益_前年同期比%"]=[cmap.get(t,{}).get("営業利益_前年同期比%",np.nan) for t in tech.ticker]
+    tech["売上高_前年同期比%"]=[cmap.get(t,{}).get("売上高_前年同期比%",np.nan) for t in tech.ticker]
+    tech["該当戦略数"]=tech[["A","B","C","D"]].sum(axis=1)
+    tech["総合スコア"]=(tech.Aスコア*.30+tech.Bスコア*.25+tech.Cスコア*.20+tech.Dスコア*.25+tech["該当戦略数"]*5).clip(upper=120)
+
+    def buy(r):
+        if r.A:return r["A買い価格"]
+        if r.B:return r["B買い価格"]
+        if r.D:return r["D買い価格"]
+        return np.nan
+    tech["買い価格目安"]=tech.apply(buy,axis=1)
+    tech["A初期損切り目安"]=np.where(tech.A,tech["A初期損切り"],np.nan)
+    tech["該当戦略"]=tech.apply(lambda r:"・".join([s for s in ["A","B","C","D"] if bool(r[s])]) or "－",axis=1)
+    tech["判定"]=tech["該当戦略数"].map(lambda n:"🔥 最優先候補" if n>=3 else "🟢 強候補" if n==2 else "🟡 候補" if n==1 else "⚪ 見送り")
+    tech=tech.sort_values(["総合スコア","該当戦略数","Aスコア","Dスコア"],ascending=False).reset_index(drop=True)
+    tech.insert(0,"順位",np.arange(1,len(tech)+1))
+    for s in ["A","B","C","D"]: tech[s]=tech[s].map(mark)
+
+    ranked=tech[tech["該当戦略数"]>=1].copy()
+    st.subheader("🏆 今日の短期上昇候補ランキング")
+    cols=["順位","銘柄","Yahoo!チャート","市場","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略数","買い価格目安","A初期損切り目安","総合スコア","判定"]
+    st.dataframe(ranked[cols],use_container_width=True,hide_index=True,column_config={
+        "銘柄":st.column_config.TextColumn("銘柄コード・銘柄名",width="large"),
+        "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo!チャート ↗"),
+        "株価":st.column_config.NumberColumn("株価",format="%.0f円"),
+        "75日線":st.column_config.NumberColumn("75日線",format="%.0f円"),
+        "75日線_比較期間前比%":st.column_config.NumberColumn(f"75日線（{slope_days}営業日前比）",format="%+.2f%%"),
+        "75日線_乖離率%":st.column_config.NumberColumn("75日線乖離",format="%+.2f%%"),
+        "買い価格目安":st.column_config.NumberColumn("買い価格目安",format="%.0f円"),
+        "A初期損切り目安":st.column_config.NumberColumn("A初期損切り",format="%.0f円"),
+        "総合スコア":st.column_config.NumberColumn("総合",format="%.1f"),
+    })
+
+    st.subheader("🔎 戦略別ランキング")
+    tabs=st.tabs(["A｜75日線押し目","B｜ブレイクアウト","C｜決算モメンタム","D｜モメンタム＋押し目"])
+    for tab,s in zip(tabs,["A","B","C","D"]):
+        with tab:
+            x=tech[tech[s]=="🟢"]
+            if x.empty: st.info("該当銘柄はありません。")
+            else:
+                st.dataframe(x[["順位","銘柄","Yahoo!チャート","株価","75日線","買い価格目安","A初期損切り目安","総合スコア","該当戦略"]],use_container_width=True,hide_index=True,column_config={
+                    "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo!チャート ↗"),
+                    "株価":st.column_config.NumberColumn("株価",format="%.0f円"),
+                    "75日線":st.column_config.NumberColumn("75日線",format="%.0f円"),
+                    "買い価格目安":st.column_config.NumberColumn("買い価格目安",format="%.0f円"),
+                    "A初期損切り目安":st.column_config.NumberColumn("A初期損切り",format="%.0f円"),
+                    "総合スコア":st.column_config.NumberColumn("総合",format="%.1f"),
+                })
+
+    with st.expander("📊 詳細な計算値を見る"):
+        st.dataframe(tech[["順位","銘柄","75日線_比較期間前比%","75日線_乖離率%","出来高_20日平均比","20日騰落率%","60日騰落率%","営業利益_前年同期比%","売上高_前年同期比%","Aスコア","Bスコア","Cスコア","Dスコア","総合スコア"]],use_container_width=True,hide_index=True)
+
+    csvcols=["順位","コード","銘柄名","市場","業種","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略","買い価格目安","A初期損切り目安","営業利益_前年同期比%","売上高_前年同期比%","総合スコア","判定","Yahoo!チャート"]
+    csv=tech[csvcols].to_csv(index=False).encode("utf-8-sig")
+    st.download_button("📥 ランキングをCSV保存",csv,"短期上昇株ハンター_ランキング.csv","text/csv",use_container_width=True)
 
 st.divider()
-st.caption("投資判断を自動化するための研究用スクリーナーです。買い・売りを保証するものではありません。")
+st.caption("本アプリはユーザー指定ルールによるスクリーニング補助です。データには遅延・欠損・取得制限があり得ます。将来の値上がりを保証するものではありません。")
