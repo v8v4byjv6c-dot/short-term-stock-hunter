@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v7",
+    page_title="短期上昇株ハンター v8",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -333,7 +333,7 @@ def financial_momentum(ticker):
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
-st.title("🎯 短期上昇株ハンター v7")
+st.title("🎯 短期上昇株ハンター v8")
 st.write("市場を選ぶだけで対象銘柄を自動取得し、A〜Dで短期上昇候補をランキングします。**普段使いはプライム推奨**です。")
 
 with st.expander("📘 A・B・C・Dとは？ ランキングの仕組み"):
@@ -355,6 +355,10 @@ A 30%・B 25%・C 20%・D 25%を合成し、複数戦略に同時該当するほ
 
 **📱 楽天証券の注文参考値**  
 A/B/Dについて、買いの逆指値条件と、A/Bの約定後の初期損切り逆指値を表示します。Aは75日線基準、Bはブレイク水準から1ATR(14)下を損切り参考値にします。表示は注文入力の補助であり、自動発注はしません。
+
+**🧠 ロジック総合診断（追加料金なし）**  
+外部AI APIは使わず、A〜Dの数値・過熱度・出来高・損切り幅などをPythonのルールで文章化します。  
+「🟢条件良好 / 🟡慎重に検討 / 🔴追いかけ注意」などの診断と、その理由・行動方針を表示します。
 """)
 
 with st.sidebar:
@@ -548,6 +552,91 @@ if st.session_state.run_scan:
     tech["D評価理由"]=tech.apply(d_reason,axis=1)
     tech["B過熱度"]=tech["Bブレイク上昇率%"].apply(heat_label)
 
+    def logic_diagnosis(r):
+        hits = int(r["該当戦略数"])
+        score = float(r["総合スコア"])
+        notes = []
+        warnings = []
+        action = "様子見"
+
+        # A
+        if bool(r["A"]):
+            dev = float(r["75日線_乖離率%"])
+            slope = float(r["75日線_比較期間前比%"])
+            if dev > -1.0:
+                notes.append(f"Aは75日線直下（乖離{dev:+.2f}%）で、買いトリガーに近い")
+            elif dev > -3.0:
+                notes.append(f"Aは75日線から{dev:+.2f}%で、押し目候補として良好")
+            else:
+                warnings.append(f"A候補だが75日線から{dev:+.2f}%離れており、上抜け確認を優先")
+            if slope >= 2:
+                notes.append(f"75日線はしっかり上向き（{slope:+.2f}%）")
+
+        # B
+        if bool(r["B"]):
+            ext = float(r["Bブレイク上昇率%"])
+            vr = float(r["B出来高倍率"])
+            if ext <= 3:
+                notes.append(f"Bはブレイク直後（+{ext:.2f}%）")
+            elif ext <= 7:
+                warnings.append(f"Bはブレイク後+{ext:.2f}%で、やや追いかけ買い注意")
+            else:
+                warnings.append(f"Bはブレイク後+{ext:.2f}%で、上がりすぎ注意")
+            if vr >= 2:
+                notes.append(f"出来高は20日平均の{vr:.2f}倍で強い資金流入")
+            elif vr >= 1.3:
+                notes.append(f"出来高は20日平均の{vr:.2f}倍でブレイクを確認")
+
+        # C
+        if bool(r["C"]):
+            og = r["営業利益_前年同期比%"]
+            if np.isfinite(og):
+                notes.append(f"Cは営業利益が前年同期比{og:+.1f}%で業績面も追い風")
+
+        # D
+        if bool(r["D"]):
+            r60 = float(r["60日騰落率%"])
+            notes.append(f"Dは60日で{r60:+.1f}%上昇した銘柄の再反発")
+
+        # Aggregate judgment
+        # Favor A because it is the user's core strategy.
+        if bool(r["A"]) and score >= 70 and not (bool(r["B"]) and float(r["Bブレイク上昇率%"]) > 7):
+            label = "🟢 条件良好"
+            action = "買い逆指値の条件到達を待つ"
+        elif hits >= 2 and score >= 65:
+            label = "🟢 有力候補"
+            action = "注文条件を確認して候補に残す"
+        elif bool(r["B"]) and float(r["Bブレイク上昇率%"]) > 7:
+            label = "🔴 追いかけ注意"
+            action = "高値追いは避け、押し待ちを優先"
+        elif score >= 50 or hits >= 1:
+            label = "🟡 慎重に検討"
+            action = "チャート確認後に判断"
+        else:
+            label = "⚪ 様子見"
+
+        # Risk callout
+        if bool(r["A"]) and np.isfinite(r["A初期損切り目安"]):
+            risk_pct = (float(r["A初期損切り目安"]) / float(r["A買い価格"]) - 1) * 100
+            if abs(risk_pct) > 5:
+                warnings.append(f"Aの初期損切り幅が{risk_pct:.1f}%と大きめ")
+        if bool(r["B"]) and np.isfinite(r["B初期損切り目安"]):
+            risk_pct = (float(r["B初期損切り目安"]) / float(r["B買い価格"]) - 1) * 100
+            if abs(risk_pct) > 6:
+                warnings.append(f"BのATR基準損切り幅が{risk_pct:.1f}%と大きい")
+
+        parts = []
+        if notes:
+            parts.append("。".join(notes))
+        if warnings:
+            parts.append("注意：" + "。".join(warnings))
+        parts.append("方針：" + action)
+        return label, "。".join(parts)
+
+    diagnosis = tech.apply(logic_diagnosis, axis=1)
+    tech["ロジック総合診断"] = [x[0] for x in diagnosis]
+    tech["診断コメント"] = [x[1] for x in diagnosis]
+
     tech["該当戦略"]=tech.apply(lambda r:"・".join([s for s in ["A","B","C","D"] if bool(r[s])]) or "－",axis=1)
     tech["判定"]=tech["該当戦略数"].map(lambda n:"🔥 最優先候補" if n>=3 else "🟢 強候補" if n==2 else "🟡 候補" if n==1 else "⚪ 見送り")
     tech=tech.sort_values(["総合スコア","該当戦略数","Aスコア","Dスコア"],ascending=False).reset_index(drop=True)
@@ -577,6 +666,22 @@ if st.session_state.run_scan:
                 "総合スコア":st.column_config.NumberColumn("総合",format="%.1f"),
             }
         )
+
+    st.subheader("🧠 ロジック総合診断")
+    st.caption("外部AIを使わず、A〜Dの数値をルールベースで文章化しています。同じ条件なら同じ診断になるため、判断基準を一定に保てます。")
+    diag_cols=["順位","銘柄","該当戦略","総合スコア","ロジック総合診断","診断コメント","Yahoo!チャート"]
+    st.dataframe(
+        tech[tech["該当戦略数"]>=1][diag_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "銘柄":st.column_config.TextColumn("銘柄",width="medium"),
+            "総合スコア":st.column_config.NumberColumn("総合",format="%.1f"),
+            "ロジック総合診断":st.column_config.TextColumn("総合診断",width="medium"),
+            "診断コメント":st.column_config.TextColumn("コメント",width="large"),
+            "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo!チャート ↗"),
+        }
+    )
 
     st.subheader("📱 楽天証券｜注文入力の参考値")
     st.caption("A/B/Dの買い候補について、楽天証券の逆指値画面に入力する形に近い文章で表示します。実際の注文前に、呼値・値幅制限・板・注文市場を必ず確認してください。")
@@ -637,7 +742,7 @@ if st.session_state.run_scan:
             use_container_width=True,hide_index=True
         )
 
-    csvcols=["順位","コード","銘柄名","市場","業種","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略","買い価格目安","A初期損切り目安","営業利益_前年同期比%","売上高_前年同期比%","A評価理由","B評価理由","B過熱度","C評価理由","D評価理由","楽天証券｜買い注文例","楽天証券｜損切り注文例","B初期損切り目安","ATR14","総合スコア","判定","Yahoo!チャート"]
+    csvcols=["順位","コード","銘柄名","市場","業種","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略","買い価格目安","A初期損切り目安","営業利益_前年同期比%","売上高_前年同期比%","A評価理由","B評価理由","B過熱度","C評価理由","D評価理由","楽天証券｜買い注文例","楽天証券｜損切り注文例","B初期損切り目安","ATR14","ロジック総合診断","診断コメント","総合スコア","判定","Yahoo!チャート"]
     csv=tech[csvcols].to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         f"📥 {market}ランキングをCSV保存",
