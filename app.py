@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v5",
+    page_title="短期上昇株ハンター v6",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -277,6 +277,9 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
         "ブレイク水準からの上昇率%":breakout_extension,
         "A":A, "Aスコア":As, "A買い価格":a_buy, "A初期損切り":a_stop,
         "B":B, "Bスコア":Bs, "B買い価格":bd_buy,
+        "Bブレイク水準":bh,
+        "Bブレイク上昇率%":breakout_extension,
+        "B出来高倍率":vr,
         "D":D, "Dスコア":Ds, "D買い価格":bd_buy,
     }
 
@@ -317,7 +320,7 @@ def financial_momentum(ticker):
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
-st.title("🎯 短期上昇株ハンター v5")
+st.title("🎯 短期上昇株ハンター v6")
 st.write("市場を選ぶだけで対象銘柄を自動取得し、A〜Dで短期上昇候補をランキングします。**普段使いはプライム推奨**です。")
 
 with st.expander("📘 A・B・C・Dとは？ ランキングの仕組み"):
@@ -458,6 +461,51 @@ if st.session_state.run_scan:
 
     tech["買い価格目安"]=tech.apply(buy,axis=1)
     tech["A初期損切り目安"]=np.where(tech.A,tech["A初期損切り"],np.nan)
+
+    def heat_label(ext):
+        if not np.isfinite(ext): return "－"
+        if ext <= 3: return "🟢 ブレイク直後"
+        if ext <= 7: return "🟡 やや上昇済み"
+        return "🔴 上がりすぎ注意"
+
+    def a_reason(r):
+        if not bool(r["A"]): return "A条件外"
+        return (
+            f"75日線は上向き（{r['75日線_比較期間前比%']:+.2f}%）／"
+            f"株価は75日線より下（乖離{r['75日線_乖離率%']:+.2f}%）／"
+            f"75日線に近いほど高評価"
+        )
+
+    def b_reason(r):
+        if not bool(r["B"]): return "B条件外"
+        ext = r["Bブレイク上昇率%"]
+        return (
+            f"{int(breakout_days)}日高値 {r['Bブレイク水準']:,.0f}円を突破／"
+            f"現在はブレイク水準から{ext:+.2f}%／"
+            f"出来高は20日平均の{r['B出来高倍率']:.2f}倍／"
+            f"20日騰落率{r['20日騰落率%']:+.2f}%／{heat_label(ext)}"
+        )
+
+    def c_reason(r):
+        if not bool(r["C"]): return "C条件外または財務データ不足"
+        og=r["営業利益_前年同期比%"]; rg=r["売上高_前年同期比%"]
+        ogs="-" if not np.isfinite(og) else f"{og:+.1f}%"
+        rgs="-" if not np.isfinite(rg) else f"{rg:+.1f}%"
+        return f"営業利益前年同期比 {ogs}／売上高前年同期比 {rgs}"
+
+    def d_reason(r):
+        if not bool(r["D"]): return "D条件外"
+        return (
+            f"60日騰落率{r['60日騰落率%']:+.2f}%／"
+            f"強い上昇後の押し目から短期反発"
+        )
+
+    tech["A評価理由"]=tech.apply(a_reason,axis=1)
+    tech["B評価理由"]=tech.apply(b_reason,axis=1)
+    tech["C評価理由"]=tech.apply(c_reason,axis=1)
+    tech["D評価理由"]=tech.apply(d_reason,axis=1)
+    tech["B過熱度"]=tech["Bブレイク上昇率%"].apply(heat_label)
+
     tech["該当戦略"]=tech.apply(lambda r:"・".join([s for s in ["A","B","C","D"] if bool(r[s])]) or "－",axis=1)
     tech["判定"]=tech["該当戦略数"].map(lambda n:"🔥 最優先候補" if n>=3 else "🟢 強候補" if n==2 else "🟡 候補" if n==1 else "⚪ 見送り")
     tech=tech.sort_values(["総合スコア","該当戦略数","Aスコア","Dスコア"],ascending=False).reset_index(drop=True)
@@ -488,6 +536,23 @@ if st.session_state.run_scan:
             }
         )
 
+    st.subheader("🧭 なぜこの評価？")
+    st.caption("各銘柄のスコア根拠を数値で確認できます。特にBは『高値を突破したか』だけでなく、ブレイク後に上がりすぎていないかも表示します。")
+    reason_cols=["順位","銘柄","A評価理由","B評価理由","B過熱度","C評価理由","D評価理由"]
+    st.dataframe(
+        tech[tech["該当戦略数"]>=1][reason_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "銘柄":st.column_config.TextColumn("銘柄",width="medium"),
+            "A評価理由":st.column_config.TextColumn("A｜評価理由",width="large"),
+            "B評価理由":st.column_config.TextColumn("B｜評価理由",width="large"),
+            "B過熱度":st.column_config.TextColumn("B｜過熱度",width="medium"),
+            "C評価理由":st.column_config.TextColumn("C｜評価理由",width="large"),
+            "D評価理由":st.column_config.TextColumn("D｜評価理由",width="large"),
+        }
+    )
+
     st.subheader("🔎 戦略別ランキング")
     tabs=st.tabs(["A｜75日線押し目","B｜ブレイクアウト","C｜決算モメンタム","D｜モメンタム＋押し目"])
     for tab,s in zip(tabs,["A","B","C","D"]):
@@ -497,7 +562,7 @@ if st.session_state.run_scan:
                 st.info("該当銘柄はありません。")
             else:
                 st.dataframe(
-                    x[["順位","銘柄","Yahoo!チャート","株価","75日線","買い価格目安","A初期損切り目安","総合スコア","該当戦略"]],
+                    x[["順位","銘柄","Yahoo!チャート","株価","75日線","買い価格目安","A初期損切り目安","B過熱度","総合スコア","該当戦略"]],
                     use_container_width=True,hide_index=True,
                     column_config={
                         "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo!チャート ↗"),
@@ -515,7 +580,7 @@ if st.session_state.run_scan:
             use_container_width=True,hide_index=True
         )
 
-    csvcols=["順位","コード","銘柄名","市場","業種","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略","買い価格目安","A初期損切り目安","営業利益_前年同期比%","売上高_前年同期比%","総合スコア","判定","Yahoo!チャート"]
+    csvcols=["順位","コード","銘柄名","市場","業種","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略","買い価格目安","A初期損切り目安","営業利益_前年同期比%","売上高_前年同期比%","A評価理由","B評価理由","B過熱度","C評価理由","D評価理由","総合スコア","判定","Yahoo!チャート"]
     csv=tech[csvcols].to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         f"📥 {market}ランキングをCSV保存",
