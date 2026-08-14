@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v4",
+    page_title="短期上昇株ハンター v5",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -225,11 +225,14 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     bh=float(x.BREAK_HIGH) if np.isfinite(x.BREAK_HIGH) else np.nan
 
     trend = slope > 0
-    near = -max_dev <= dev <= 2.0
+    # Aは参考書どおり「75日線より下」にある銘柄だけを候補にする。
+    # そのうえで、75日線とのマイナス乖離が小さいほど高評価。
+    below_75 = close < ma75
+    near = -max_dev <= dev < 0.0
     crossed = np.isfinite(float(p.MA75)) and float(p.Close) <= float(p.MA75) and close > ma75
     bullish = close > float(p.Close) and close > float(x.Open)
 
-    A = trend and near
+    A = trend and below_75 and near
     dist = max(0,100-abs(dev)/max(max_dev,.1)*100)
     sl = min(100,max(0,slope/5*100))
     As = min(100,max(0,.50*dist+.35*sl+15*crossed+8*bullish))
@@ -237,7 +240,29 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     a_stop = ma75*(1-a_stop_buffer_pct/100)
 
     B = bool(trend and np.isfinite(bh) and close > bh and vr >= 1.3)
-    Bs = min(100,max(0,min(45,max(0,r20*2))+min(30,max(0,(vr-1)*30))+(25 if B else 0)))
+    # ブレイク水準から上がりすぎている場合は「追いかけ買い」リスクとして減点。
+    breakout_extension = ((close / bh) - 1) * 100 if np.isfinite(bh) and bh > 0 else np.nan
+    extension_penalty = 0
+    if np.isfinite(breakout_extension):
+        if breakout_extension > 10:
+            extension_penalty = 30
+        elif breakout_extension > 7:
+            extension_penalty = 20
+        elif breakout_extension > 5:
+            extension_penalty = 12
+        elif breakout_extension > 3:
+            extension_penalty = 5
+
+    Bs = min(
+        100,
+        max(
+            0,
+            min(45,max(0,r20*2))
+            + min(30,max(0,(vr-1)*30))
+            + (25 if B else 0)
+            - extension_penalty
+        )
+    )
 
     recent = float(d.Close.tail(20).max())
     drawdown = (close/recent-1)*100
@@ -249,6 +274,7 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
         "株価":close, "75日線":ma75,
         "75日線_比較期間前比%":slope, "75日線_乖離率%":dev,
         "出来高_20日平均比":vr, "20日騰落率%":r20, "60日騰落率%":r60,
+        "ブレイク水準からの上昇率%":breakout_extension,
         "A":A, "Aスコア":As, "A買い価格":a_buy, "A初期損切り":a_stop,
         "B":B, "Bスコア":Bs, "B買い価格":bd_buy,
         "D":D, "Dスコア":Ds, "D買い価格":bd_buy,
@@ -291,16 +317,16 @@ def financial_momentum(ticker):
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
-st.title("🎯 短期上昇株ハンター v4")
+st.title("🎯 短期上昇株ハンター v5")
 st.write("市場を選ぶだけで対象銘柄を自動取得し、A〜Dで短期上昇候補をランキングします。**普段使いはプライム推奨**です。")
 
 with st.expander("📘 A・B・C・Dとは？ ランキングの仕組み"):
     st.markdown("""
 **A｜75日線押し目**  
-75日線が上向きで、株価が75日線近辺まで調整した銘柄を評価。75日線上抜けを買いトリガー、再度75日線を明確に割る水準を初期損切り目安とします。
+75日線が上向いており、**現在の株価が75日線より下**にある銘柄だけを候補にします。その中で75日線とのマイナス乖離が小さい銘柄を高く評価します。まだ買わず、75日線を上抜けた価格を買いトリガーにし、買った後に75日線を再び明確に割る水準を初期損切り目安とします。
 
 **B｜ブレイクアウト**  
-75日線が上向きで、過去一定期間の高値を更新し、出来高も増えている銘柄を評価します。
+75日線が上向きで、過去一定期間の高値を更新し、出来高も増えている銘柄を評価します。ただし、ブレイク水準からすでに大きく上がりすぎている場合は「追いかけ買い」リスクとしてスコアを減点します。
 
 **C｜決算モメンタム**  
 四半期営業利益が前年同期比+20%以上で、売上高が取得できる場合は減収でない銘柄を評価。Yahoo Financeで取得可能な四半期財務による暫定ロジックです。
@@ -485,7 +511,7 @@ if st.session_state.run_scan:
 
     with st.expander("📊 詳細な計算値を見る"):
         st.dataframe(
-            tech[["順位","銘柄","75日線_比較期間前比%","75日線_乖離率%","出来高_20日平均比","20日騰落率%","60日騰落率%","営業利益_前年同期比%","売上高_前年同期比%","Aスコア","Bスコア","Cスコア","Dスコア","総合スコア"]],
+            tech[["順位","銘柄","75日線_比較期間前比%","75日線_乖離率%","出来高_20日平均比","20日騰落率%","60日騰落率%","ブレイク水準からの上昇率%","営業利益_前年同期比%","売上高_前年同期比%","Aスコア","Bスコア","Cスコア","Dスコア","総合スコア"]],
             use_container_width=True,hide_index=True
         )
 
