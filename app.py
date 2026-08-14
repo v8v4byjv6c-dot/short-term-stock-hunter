@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v10",
+    page_title="短期上昇株ハンター v11",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -350,7 +350,7 @@ def financial_momentum(ticker):
 # UI
 # ------------------------------------------------------------
 
-st.title("🎯 短期上昇株ハンター v10")
+st.title("🎯 短期上昇株ハンター v11")
 st.write("同じURLの中で、**📘 本ベース A/B/C/D** と **🧪 AI式・独自統合スクリーナー**を切り替えられます。")
 
 mode = st.radio(
@@ -531,6 +531,39 @@ def ai_scores(r):
     else:
         grade="⚪ 見送り"
 
+    # 楽天証券向けの注文コメント（AI式）
+    current=float(r["株価"])
+    risk_pct=((stop/trigger)-1)*100 if trigger and np.isfinite(stop) else np.nan
+    chase = (dev > 20) or (np.isfinite(ext) and ext > 7) or ease < 45
+
+    if chase:
+        rakuten_action="🟠 今は注文を置かず押し待ち"
+        rakuten_buy="現在値で追いかけず、買いやすさが改善するまで監視"
+        rakuten_after="押し目形成後に買いトリガーを再計算"
+    elif setup.startswith("🔥"):
+        rakuten_action="🟢 逆指値・買い（ブレイク確認）"
+        rakuten_buy=f"株価が{trigger:.0f}円以上になったら買い。条件到達後は指値を基本候補にする"
+        rakuten_after=f"約定後は{stop:.0f}円以下を損切り逆指値の参考にする"
+    elif setup.startswith("🚀"):
+        rakuten_action="🟡 逆指値・買い（高値追いに注意）"
+        rakuten_buy=f"株価が{trigger:.0f}円以上を維持する場合のみ買い候補。寄り付き急騰なら見送る"
+        rakuten_after=f"約定後は{stop:.0f}円以下を損切り逆指値の参考にする"
+    elif setup.startswith("🎯"):
+        rakuten_action="🟢 逆指値・買い（反発確認）"
+        rakuten_buy=f"75日線付近から反発し、株価が{trigger:.0f}円以上になったら買い候補"
+        rakuten_after=f"約定後は{stop:.0f}円以下を損切り逆指値の参考にする"
+    elif setup.startswith("💹"):
+        rakuten_action="🟡 決算後の値動きを確認して逆指値"
+        rakuten_buy=f"決算だけで成行買いせず、株価が{trigger:.0f}円以上で強さを確認して買い候補"
+        rakuten_after=f"約定後は{stop:.0f}円以下を損切り逆指値の参考にする"
+    else:
+        rakuten_action="🟡 条件確認後に逆指値"
+        rakuten_buy=f"株価が{trigger:.0f}円以上になり、出来高・トレンドが崩れていなければ買い候補"
+        rakuten_after=f"約定後は{stop:.0f}円以下を損切り逆指値の参考にする"
+
+    rakuten_risk = f"{risk_pct:.1f}%" if np.isfinite(risk_pct) else "算出不可"
+    rakuten_comment = f"{rakuten_action}｜{rakuten_buy}｜{rakuten_after}｜想定初期リスク {rakuten_risk}"
+
     reasons=[]
     if trend>=75: reasons.append("上昇トレンドが強い")
     if volume>=70: reasons.append(f"出来高{vr:.2f}倍で資金流入")
@@ -555,6 +588,11 @@ def ai_scores(r):
         "AI式コメント":comment,
         "買いトリガー":trigger,
         "損切り参考":stop,
+        "楽天証券｜注文方針":rakuten_action,
+        "楽天証券｜買い方":rakuten_buy,
+        "楽天証券｜約定後":rakuten_after,
+        "想定初期リスク%":risk_pct,
+        "楽天証券｜注文コメント":rakuten_comment,
     })
 
 if st.session_state.run_scan_v10:
@@ -669,7 +707,7 @@ if st.session_state.run_scan_v10:
         st.subheader("🧪 AI式｜総合ランキング")
         st.caption("『上昇力』が高くても『今の買いやすさ』が低ければ、強いけれど高値追いすべきではない銘柄として分離します。")
         st.dataframe(
-            tech.head(100)[["順位","銘柄","Yahoo!チャート","株価","AI式総合","上昇力","今の買いやすさ","セットアップ","AI式診断","買いトリガー","損切り参考","AI式コメント"]],
+            tech.head(100)[["順位","銘柄","Yahoo!チャート","株価","AI式総合","上昇力","今の買いやすさ","セットアップ","AI式診断","買いトリガー","損切り参考","想定初期リスク%","楽天証券｜注文方針","AI式コメント"]],
             use_container_width=True,hide_index=True,
             column_config={
                 "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
@@ -679,9 +717,28 @@ if st.session_state.run_scan_v10:
                 "今の買いやすさ":st.column_config.ProgressColumn("買いやすさ",min_value=0,max_value=100,format="%.1f"),
                 "買いトリガー":st.column_config.NumberColumn("買いトリガー",format="%.0f円"),
                 "損切り参考":st.column_config.NumberColumn("損切り参考",format="%.0f円"),
+                "想定初期リスク%":st.column_config.NumberColumn("初期リスク",format="%.1f%%"),
+                "楽天証券｜注文方針":st.column_config.TextColumn("楽天証券｜注文方針",width="large"),
                 "AI式コメント":st.column_config.TextColumn("コメント",width="large"),
             }
         )
+
+        st.subheader("📱 AI式｜楽天証券での買い方")
+        st.caption("セットアップごとに、逆指値の使い方・買いトリガー・約定後の損切り参考値を文章化します。これは自動発注ではありません。")
+        st.dataframe(
+            tech.head(100)[["順位","銘柄","セットアップ","AI式診断","楽天証券｜注文方針","楽天証券｜買い方","楽天証券｜約定後","買いトリガー","損切り参考","想定初期リスク%","Yahoo!チャート"]],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "楽天証券｜注文方針":st.column_config.TextColumn("注文方針",width="large"),
+                "楽天証券｜買い方":st.column_config.TextColumn("買い方",width="large"),
+                "楽天証券｜約定後":st.column_config.TextColumn("約定後",width="large"),
+                "買いトリガー":st.column_config.NumberColumn("買いトリガー",format="%.0f円"),
+                "損切り参考":st.column_config.NumberColumn("損切り参考",format="%.0f円"),
+                "想定初期リスク%":st.column_config.NumberColumn("初期リスク",format="%.1f%%"),
+                "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
+            }
+        )
+        st.warning("逆指値はトリガー到達＝約定保証ではありません。指値は急騰時に約定しない可能性、成行は想定より不利な価格で約定する可能性があります。")
 
         tabs=st.tabs(["🔥 ブレイク準備中","🎯 押し目","🚀 ブレイク直後","💹 決算加速","📊 6要素の内訳"])
         setup_filters=[
@@ -704,4 +761,4 @@ if st.session_state.run_scan_v10:
         st.download_button("📥 AI式ランキングをCSV保存",csv,f"AI式ランキング_{market}.csv","text/csv",use_container_width=True)
 
 st.divider()
-st.caption("v10は1つのStreamlit URL・1つのGitHubリポジトリで2モードを切り替えます。AI式モードは生成AIではなく独自統合ルールです。投資判断・将来の値上がりを保証しません。")
+st.caption("v11は1つのStreamlit URL・1つのGitHubリポジトリで2モードを切り替え、AI式にも楽天証券向け注文コメントを表示します。AI式モードは生成AIではなく独自統合ルールです。投資判断・将来の値上がりを保証しません。")
