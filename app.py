@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v6",
+    page_title="短期上昇株ハンター v7",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -212,6 +212,13 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     d["BREAK_HIGH"] = d.High.shift(1).rolling(breakout_days).max()
     d["V20"] = d.Volume.rolling(20).mean()
     d["VR"] = d.Volume/d.V20
+    prev_close = d.Close.shift(1)
+    tr = pd.concat([
+        d.High - d.Low,
+        (d.High - prev_close).abs(),
+        (d.Low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    d["ATR14"] = tr.rolling(14).mean()
 
     x, p = d.iloc[-1], d.iloc[-2]
     vals = [x.Close,x.High,x.MA25,x.MA75,x.OLD,x.DEV,x.R5,x.R20,x.R60]
@@ -223,6 +230,7 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     dev=float(x.DEV); r5=float(x.R5); r20=float(x.R20); r60=float(x.R60)
     vr=float(x.VR) if np.isfinite(x.VR) else 0
     bh=float(x.BREAK_HIGH) if np.isfinite(x.BREAK_HIGH) else np.nan
+    atr14=float(x.ATR14) if np.isfinite(x.ATR14) else np.nan
 
     trend = slope > 0
     # Aは参考書どおり「75日線より下」にある銘柄だけを候補にする。
@@ -269,6 +277,9 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     D = bool(trend and r60>=10 and drawdown<=-3 and r5>0 and close>ma25)
     Ds = min(100,max(0,min(45,max(0,r60*1.5))+min(25,max(0,r5*4))+(30 if D else 0)))
     bd_buy = high + tick_size(high)
+    # Bの初期損切り参考値：ブレイク水準 - 1ATR(14)
+    # 値動きが大きい銘柄ほど余裕を持たせる。
+    b_stop = (bh - atr14) if np.isfinite(bh) and np.isfinite(atr14) else np.nan
 
     return {
         "株価":close, "75日線":ma75,
@@ -280,6 +291,8 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
         "Bブレイク水準":bh,
         "Bブレイク上昇率%":breakout_extension,
         "B出来高倍率":vr,
+        "ATR14":atr14,
+        "B初期損切り":b_stop,
         "D":D, "Dスコア":Ds, "D買い価格":bd_buy,
     }
 
@@ -320,7 +333,7 @@ def financial_momentum(ticker):
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
-st.title("🎯 短期上昇株ハンター v6")
+st.title("🎯 短期上昇株ハンター v7")
 st.write("市場を選ぶだけで対象銘柄を自動取得し、A〜Dで短期上昇候補をランキングします。**普段使いはプライム推奨**です。")
 
 with st.expander("📘 A・B・C・Dとは？ ランキングの仕組み"):
@@ -339,6 +352,9 @@ with st.expander("📘 A・B・C・Dとは？ ランキングの仕組み"):
 
 **🏆 総合ランキング**  
 A 30%・B 25%・C 20%・D 25%を合成し、複数戦略に同時該当するほど加点します。
+
+**📱 楽天証券の注文参考値**  
+A/B/Dについて、買いの逆指値条件と、A/Bの約定後の初期損切り逆指値を表示します。Aは75日線基準、Bはブレイク水準から1ATR(14)下を損切り参考値にします。表示は注文入力の補助であり、自動発注はしません。
 """)
 
 with st.sidebar:
@@ -461,6 +477,32 @@ if st.session_state.run_scan:
 
     tech["買い価格目安"]=tech.apply(buy,axis=1)
     tech["A初期損切り目安"]=np.where(tech.A,tech["A初期損切り"],np.nan)
+    tech["B初期損切り目安"]=np.where(tech.B,tech["B初期損切り"],np.nan)
+
+    def rakuten_buy_order(r):
+        # Aを優先。AでなければB、次にD。
+        if bool(r["A"]):
+            p=float(r["A買い価格"])
+            return f"逆指値（買い）：株価が{p:,.0f}円以上 → {p:,.0f}円の指値を発注"
+        if bool(r["B"]):
+            p=float(r["B買い価格"])
+            return f"逆指値（買い）：株価が{p:,.0f}円以上 → {p:,.0f}円の指値を発注"
+        if bool(r["D"]):
+            p=float(r["D買い価格"])
+            return f"逆指値（買い）：株価が{p:,.0f}円以上 → {p:,.0f}円の指値を発注"
+        return "－"
+
+    def rakuten_stop_order(r):
+        if bool(r["A"]) and np.isfinite(r["A初期損切り"]):
+            p=float(r["A初期損切り"])
+            return f"約定後の逆指値（売り）：株価が{p:,.0f}円以下 → 成行"
+        if bool(r["B"]) and np.isfinite(r["B初期損切り"]):
+            p=float(r["B初期損切り"])
+            return f"約定後の逆指値（売り）：株価が{p:,.0f}円以下 → 成行（ブレイク水準−1ATR）"
+        return "－"
+
+    tech["楽天証券｜買い注文例"]=tech.apply(rakuten_buy_order,axis=1)
+    tech["楽天証券｜損切り注文例"]=tech.apply(rakuten_stop_order,axis=1)
 
     def heat_label(ext):
         if not np.isfinite(ext): return "－"
@@ -536,6 +578,21 @@ if st.session_state.run_scan:
             }
         )
 
+    st.subheader("📱 楽天証券｜注文入力の参考値")
+    st.caption("A/B/Dの買い候補について、楽天証券の逆指値画面に入力する形に近い文章で表示します。実際の注文前に、呼値・値幅制限・板・注文市場を必ず確認してください。")
+    order_cols=["順位","銘柄","該当戦略","楽天証券｜買い注文例","楽天証券｜損切り注文例"]
+    st.dataframe(
+        tech[tech["該当戦略数"]>=1][order_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "銘柄":st.column_config.TextColumn("銘柄",width="medium"),
+            "楽天証券｜買い注文例":st.column_config.TextColumn("買い注文の入力例",width="large"),
+            "楽天証券｜損切り注文例":st.column_config.TextColumn("約定後の損切り入力例",width="large"),
+        }
+    )
+    st.info("逆指値は条件到達後に初めて市場へ注文が出ます。指値の場合は価格が飛ぶと約定しないことがあり、成行の場合は想定より不利な価格で約定する可能性があります。")
+
     st.subheader("🧭 なぜこの評価？")
     st.caption("各銘柄のスコア根拠を数値で確認できます。特にBは『高値を突破したか』だけでなく、ブレイク後に上がりすぎていないかも表示します。")
     reason_cols=["順位","銘柄","A評価理由","B評価理由","B過熱度","C評価理由","D評価理由"]
@@ -580,7 +637,7 @@ if st.session_state.run_scan:
             use_container_width=True,hide_index=True
         )
 
-    csvcols=["順位","コード","銘柄名","市場","業種","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略","買い価格目安","A初期損切り目安","営業利益_前年同期比%","売上高_前年同期比%","A評価理由","B評価理由","B過熱度","C評価理由","D評価理由","総合スコア","判定","Yahoo!チャート"]
+    csvcols=["順位","コード","銘柄名","市場","業種","株価","75日線","75日線_比較期間前比%","75日線_乖離率%","A","B","C","D","該当戦略","買い価格目安","A初期損切り目安","営業利益_前年同期比%","売上高_前年同期比%","A評価理由","B評価理由","B過熱度","C評価理由","D評価理由","楽天証券｜買い注文例","楽天証券｜損切り注文例","B初期損切り目安","ATR14","総合スコア","判定","Yahoo!チャート"]
     csv=tech[csvcols].to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         f"📥 {market}ランキングをCSV保存",
