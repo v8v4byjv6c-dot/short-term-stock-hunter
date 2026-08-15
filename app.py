@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v11",
+    page_title="短期上昇株ハンター v13",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -350,7 +350,153 @@ def financial_momentum(ticker):
 # UI
 # ------------------------------------------------------------
 
-st.title("🎯 短期上昇株ハンター v11")
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_market_regime():
+    """TOPIXと日経平均のトレンドから、短期売買の地合いを簡易判定する。"""
+    out = []
+    for ticker, name in [("^TOPX", "TOPIX"), ("^N225", "日経平均")]:
+        try:
+            d = yf.download(ticker, period="6mo", auto_adjust=True, progress=False, threads=False)
+            if d is None or d.empty or len(d) < 80:
+                continue
+            close = d["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close = close.dropna()
+            ma20 = close.rolling(20).mean()
+            ma75 = close.rolling(75).mean()
+            now = float(close.iloc[-1])
+            m20 = float(ma20.iloc[-1])
+            m75 = float(ma75.iloc[-1])
+            slope75 = (m75 / float(ma75.iloc[-11]) - 1) * 100 if len(ma75.dropna()) >= 11 else 0
+            score = 0
+            score += 35 if now > m20 else 0
+            score += 30 if m20 > m75 else 0
+            score += 25 if slope75 > 0 else 0
+            score += 10 if float(close.iloc[-1] / close.iloc[-6] - 1) > 0 else 0
+            out.append({"指数":name, "現在値":now, "20日線":m20, "75日線":m75, "75日線傾き%":slope75, "地合い点":score})
+        except Exception:
+            pass
+
+    if not out:
+        return {"label":"⚪ 地合い不明", "score":50, "comment":"指数データを取得できませんでした。", "details":[]}
+
+    score = sum(x["地合い点"] for x in out) / len(out)
+    if score >= 80:
+        label, comment = "🟢 強気", "個別株の買いシグナルを通常どおり評価しやすい地合いです。"
+    elif score >= 60:
+        label, comment = "🟡 やや強気", "買い候補は選別しつつ、通常サイズを検討できる地合いです。"
+    elif score >= 40:
+        label, comment = "🟠 中立", "新規買いはトリガー確認を重視し、追いかけ買いを避けたい地合いです。"
+    else:
+        label, comment = "🔴 弱気", "新規買いを厳選し、ポジションを小さめにすることを検討したい地合いです。"
+    return {"label":label, "score":score, "comment":comment, "details":out}
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_earnings_date_info(ticker):
+    """yfinanceで取得できる場合だけ次回決算日を返す。取得不能時は無理に推定しない。"""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        dates = []
+        if isinstance(cal, dict):
+            v = cal.get("Earnings Date") or cal.get("EarningsDate")
+            if isinstance(v, (list, tuple)):
+                dates = list(v)
+            elif v is not None:
+                dates = [v]
+        elif isinstance(cal, pd.DataFrame) and not cal.empty:
+            for key in ["Earnings Date", "EarningsDate"]:
+                if key in cal.index:
+                    vals = cal.loc[key]
+                    dates = vals.tolist() if hasattr(vals, "tolist") else [vals]
+                    break
+        parsed = [pd.Timestamp(x).tz_localize(None) if pd.Timestamp(x).tzinfo else pd.Timestamp(x) for x in dates if pd.notna(x)]
+        today = pd.Timestamp.now().normalize()
+        future = sorted([x.normalize() for x in parsed if x.normalize() >= today])
+        if not future:
+            return {"date":None, "days":None, "warning":""}
+        dt = future[0]
+        days = int((dt - today).days)
+        warn = "🔴 決算直前" if days <= 3 else ("🟠 決算1週間以内" if days <= 7 else "")
+        return {"date":dt.strftime("%Y-%m-%d"), "days":days, "warning":warn}
+    except Exception:
+        return {"date":None, "days":None, "warning":""}
+
+def backtest_current_ai_logic(d, slope_days=20, breakout_days=60, horizon=5, target_pct=5.0, stop_pct=3.0):
+    """
+    過去時点で得られた株価・出来高だけを使う簡易ウォークフォワード検証。
+    AI式の技術面に近い条件で候補日を抽出し、その後horizon営業日の+target/-stop到達を集計。
+    財務(C)は将来情報混入を避けるため、この簡易版バックテストでは使わない。
+    """
+    if d is None or len(d) < max(120, breakout_days + 80):
+        return None
+    x = d.copy()
+    for c in ["Open","High","Low","Close","Volume"]:
+        if c in x.columns and isinstance(x[c], pd.DataFrame):
+            x[c] = x[c].iloc[:,0]
+    x = x.dropna(subset=["Close","High","Low","Volume"]).copy()
+    x["MA20"] = x.Close.rolling(20).mean()
+    x["MA75"] = x.Close.rolling(75).mean()
+    x["V20"] = x.Volume.rolling(20).mean()
+    x["R5"] = x.Close.pct_change(5)*100
+    x["R20"] = x.Close.pct_change(20)*100
+    x["R60"] = x.Close.pct_change(60)*100
+    x["Slope75"] = (x.MA75/x.MA75.shift(slope_days)-1)*100
+    x["Dev75"] = (x.Close/x.MA75-1)*100
+    x["VR"] = x.Volume/x.V20
+    x["PrevHigh"] = x.High.shift(1).rolling(breakout_days).max()
+    x["Ext"] = (x.Close/x.PrevHigh-1)*100
+
+    signals = (
+        (x.Slope75 > 0) &
+        (x.R60 > 5) &
+        (x.VR >= 1.0) &
+        (x.Dev75 > -5) & (x.Dev75 < 20) &
+        (
+            ((x.Ext >= -3) & (x.Ext <= 3)) |
+            ((x.Dev75 >= -3) & (x.Dev75 <= 8))
+        )
+    )
+    idxs = list(x.index[signals])
+    # Avoid counting clusters of nearly identical consecutive signals.
+    chosen = []
+    last_pos = -99
+    posmap = {idx:i for i,idx in enumerate(x.index)}
+    for idx in idxs:
+        p = posmap[idx]
+        if p - last_pos >= horizon:
+            chosen.append(idx)
+            last_pos = p
+
+    rows = []
+    for idx in chosen:
+        p = posmap[idx]
+        if p + horizon >= len(x):
+            continue
+        entry = float(x.Close.iloc[p])
+        fut = x.iloc[p+1:p+1+horizon]
+        max_up = (float(fut.High.max())/entry-1)*100
+        max_down = (float(fut.Low.min())/entry-1)*100
+        ret = (float(fut.Close.iloc[-1])/entry-1)*100
+        target_hit = max_up >= target_pct
+        stop_hit = max_down <= -stop_pct
+        rows.append((ret,max_up,max_down,target_hit,stop_hit))
+
+    if not rows:
+        return None
+    bt = pd.DataFrame(rows, columns=["ret","max_up","max_down","target_hit","stop_hit"])
+    return {
+        "件数":len(bt),
+        f"{horizon}日平均リターン%":float(bt.ret.mean()),
+        f"{horizon}日中央値%":float(bt.ret.median()),
+        f"+{target_pct:.0f}%到達率":float(bt.target_hit.mean()*100),
+        f"-{stop_pct:.0f}%到達率":float(bt.stop_hit.mean()*100),
+        "平均最大上昇%":float(bt.max_up.mean()),
+        "平均最大下落%":float(bt.max_down.mean()),
+    }
+
+st.title("🎯 短期上昇株ハンター v13")
 st.write("同じURLの中で、**📘 本ベース A/B/C/D** と **🧪 AI式・独自統合スクリーナー**を切り替えられます。")
 
 mode = st.radio(
@@ -392,6 +538,12 @@ with st.sidebar:
     a_stop_buffer_pct = st.slider("A：75日線割れの損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%")
     breakout_days = st.slider("高値更新を見る期間",20,120,60,10)
     c_check_count = st.slider("決算を詳しく確認する上位銘柄数",30,200,100,10)
+    st.divider()
+    st.subheader("v13 検証設定")
+    bt_top_n = st.slider("バックテストする上位銘柄数",5,30,10,5, help="処理時間を抑えるため、AI式ランキング上位だけを検証します。")
+    bt_horizon = st.selectbox("何営業日先まで検証するか",[5,10,20],index=0)
+    bt_target = st.selectbox("上昇目標",[3.0,5.0,8.0,10.0],index=1,format_func=lambda x:f"+{x:.0f}%")
+    bt_stop = st.selectbox("下落警戒ライン",[2.0,3.0,5.0],index=1,format_func=lambda x:f"-{x:.0f}%")
 
 try:
     all_u = get_jpx_universe()
@@ -399,35 +551,53 @@ except Exception as e:
     st.error(f"東証銘柄一覧を取得できませんでした：{e}")
     st.stop()
 
-if "selected_market" not in st.session_state:
-    st.session_state.selected_market = "プライム"
+if "selected_markets_v12" not in st.session_state:
+    st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
 
 st.subheader("🏢 スキャンする市場")
-b1,b2,b3,b4,b5 = st.columns(5)
-buttons = [
-    (b1,"⭐ プライム","プライム"),
-    (b2,"スタンダード","スタンダード"),
-    (b3,"グロース","グロース"),
-    (b4,"TOKYO PRO","TOKYO PRO"),
-    (b5,"全市場","全市場"),
-]
-for col,label,value in buttons:
-    with col:
-        if st.button(label, type="primary" if st.session_state.selected_market==value else "secondary", use_container_width=True):
-            st.session_state.selected_market=value
-            st.session_state.run_scan_v10=True
+st.caption("複数選択できます。例：プライム＋スタンダード。初期設定はプライムのみです。")
 
-market = st.session_state.selected_market
-universe = select_market_universe(all_u, market)
+market_options = ["プライム", "スタンダード", "グロース", "TOKYO PRO"]
+selected_markets = st.multiselect(
+    "対象市場",
+    market_options,
+    default=st.session_state.selected_markets_v12,
+    help="選択した市場をまとめて1つのランキングにします。"
+)
+st.session_state.selected_markets_v12 = selected_markets
+
+parts = []
+for m in selected_markets:
+    x = select_market_universe(all_u, m)
+    if x is not None and not x.empty:
+        parts.append(x)
+
+if parts:
+    universe = pd.concat(parts, ignore_index=True).drop_duplicates("コード")
+else:
+    universe = pd.DataFrame(columns=all_u.columns)
+
+market_label = "＋".join(selected_markets) if selected_markets else "未選択"
 
 m1,m2,m3 = st.columns(3)
-m1.metric("選択中", market)
+m1.metric("選択中", market_label)
 m2.metric("対象", f"{len(universe):,}銘柄")
 m3.metric("モード", "本ベース" if mode.startswith("📘") else "AI式")
 
-if st.button(f"🚀 {market}をスキャン", type="primary", use_container_width=True):
+regime = get_market_regime()
+st.info(f"**市場地合い：{regime['label']}（{regime['score']:.0f}/100）**  {regime['comment']}")
+with st.expander("地合い判定の内訳"):
+    if regime["details"]:
+        st.dataframe(pd.DataFrame(regime["details"]), use_container_width=True, hide_index=True)
+    else:
+        st.write("指数データを取得できませんでした。")
+
+if not selected_markets:
+    st.warning("市場を1つ以上選択してください。")
+
+if st.button(f"🚀 {market_label}をスキャン", type="primary", use_container_width=True, disabled=not selected_markets):
     st.session_state.run_scan_v10=True
 
 def ai_pre_score(r):
@@ -487,6 +657,20 @@ def ai_scores(r):
     if bool(r.get("C",False)) and r20>0:
         entry=max(entry,75)
         if setup=="監視": setup="💹 決算加速"
+
+    signals=[]
+    if slope>0 and -3<=dev<0:
+        signals.append("🎯 押し目")
+    if np.isfinite(ext) and -3<=ext<=0 and slope>0 and vr>=1.1:
+        signals.append("🔥 ブレイク準備中")
+    if np.isfinite(ext) and 0<ext<=3 and vr>=1.3 and slope>0:
+        signals.append("🚀 ブレイク直後")
+    if bool(r.get("C",False)) and r20>0:
+        signals.append("💹 決算加速")
+    if r60>=15 and -3<=r5<=5 and 0<=dev<=12 and slope>0:
+        signals.append("📈 モメンタム継続")
+    if not signals:
+        signals=["監視"]
 
     # Risk / overheat; higher score = safer
     risk=95
@@ -584,6 +768,7 @@ def ai_scores(r):
         "エントリー":entry,
         "リスク":risk,
         "セットアップ":setup,
+        "追加シグナル":"・".join(signals),
         "AI式診断":grade,
         "AI式コメント":comment,
         "買いトリガー":trigger,
@@ -603,7 +788,7 @@ if st.session_state.run_scan_v10:
 
     status=st.empty()
     progress=st.progress(0)
-    status.info(f"① {market}の株価データを取得しています…")
+    status.info(f"① {market_label}の株価データを取得しています…")
     data=download_batch(universe.ticker.tolist(),period)
     rows=[]; total=len(universe)
 
@@ -645,6 +830,25 @@ if st.session_state.run_scan_v10:
     tech["Cスコア"]=[cmap.get(t,{}).get("Cスコア",0) for t in tech.ticker]
     tech["営業利益_前年同期比%"]=[cmap.get(t,{}).get("営業利益_前年同期比%",np.nan) for t in tech.ticker]
     tech["売上高_前年同期比%"]=[cmap.get(t,{}).get("売上高_前年同期比%",np.nan) for t in tech.ticker]
+    tech["C確認済み"]=[t in cmap for t in tech.ticker]
+    tech["Cデータ取得成功"]=[
+        bool(cmap.get(t)) and (
+            np.isfinite(cmap.get(t,{}).get("営業利益_前年同期比%", np.nan))
+            or np.isfinite(cmap.get(t,{}).get("売上高_前年同期比%", np.nan))
+        )
+        for t in tech.ticker
+    ]
+
+    c_checked = int(tech["C確認済み"].sum())
+    c_success = int(tech["Cデータ取得成功"].sum())
+    c_hits = int(tech["C"].sum())
+
+    st.subheader("🧾 決算モメンタム（C）の取得状況")
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Cを確認した銘柄", f"{c_checked:,} / {len(tech):,}")
+    c2.metric("決算データ取得成功", f"{c_success:,}")
+    c3.metric("C該当", f"{c_hits:,}")
+    st.caption("Cは処理時間短縮のため上位候補だけ詳しく取得します。Cが付かない＝決算が悪い、とは限りません。未確認・データ不足の銘柄もあります。")
 
     if mode.startswith("📘"):
         status.success("本ベースランキングを作成しました。")
@@ -704,10 +908,24 @@ if st.session_state.run_scan_v10:
         tech=tech.sort_values(["AI式総合","今の買いやすさ","上昇力"],ascending=False).reset_index(drop=True)
         tech.insert(0,"順位",np.arange(1,len(tech)+1))
 
+        # 決算日警告：上位候補だけ取得して速度を維持
+        earnings_infos = {}
+        for t in tech.head(min(30,len(tech))).ticker:
+            earnings_infos[t] = get_earnings_date_info(t)
+        tech["次回決算日"] = [earnings_infos.get(t,{}).get("date") for t in tech.ticker]
+        tech["決算まで日数"] = [earnings_infos.get(t,{}).get("days") for t in tech.ticker]
+        tech["決算警告"] = [earnings_infos.get(t,{}).get("warning","") for t in tech.ticker]
+
+        # 地合いを診断コメントへ反映
+        if regime["score"] < 40:
+            tech["AI式コメント"] = tech["AI式コメント"].astype(str) + "／地合い弱気のため新規買いは厳選"
+        elif regime["score"] < 60:
+            tech["AI式コメント"] = tech["AI式コメント"].astype(str) + "／地合い中立"
+
         st.subheader("🧪 AI式｜総合ランキング")
         st.caption("『上昇力』が高くても『今の買いやすさ』が低ければ、強いけれど高値追いすべきではない銘柄として分離します。")
         st.dataframe(
-            tech.head(100)[["順位","銘柄","Yahoo!チャート","株価","AI式総合","上昇力","今の買いやすさ","セットアップ","AI式診断","買いトリガー","損切り参考","想定初期リスク%","楽天証券｜注文方針","AI式コメント"]],
+            tech.head(100)[["順位","銘柄","Yahoo!チャート","株価","AI式総合","上昇力","今の買いやすさ","セットアップ","追加シグナル","AI式診断","次回決算日","決算まで日数","決算警告","買いトリガー","損切り参考","想定初期リスク%","楽天証券｜注文方針","AI式コメント"]],
             use_container_width=True,hide_index=True,
             column_config={
                 "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
@@ -722,6 +940,25 @@ if st.session_state.run_scan_v10:
                 "AI式コメント":st.column_config.TextColumn("コメント",width="large"),
             }
         )
+
+        st.subheader("🧪 v13｜過去データ簡易バックテスト")
+        st.caption("AI式ランキング上位銘柄について、過去時点の株価・出来高だけで類似シグナルを再現します。財務(C)は将来情報混入を避けるため、この簡易検証には含めません。")
+        bt_rows=[]
+        for _, rr in tech.head(min(bt_top_n,len(tech))).iterrows():
+            d_bt = data.get(rr["ticker"])
+            res = backtest_current_ai_logic(
+                d_bt, slope_days=slope_days, breakout_days=breakout_days,
+                horizon=bt_horizon, target_pct=bt_target, stop_pct=bt_stop
+            )
+            if res:
+                res.update({"順位":int(rr["順位"]), "銘柄":rr["銘柄"], "AI式総合":float(rr["AI式総合"])})
+                bt_rows.append(res)
+        if bt_rows:
+            bt_df=pd.DataFrame(bt_rows).sort_values(f"+{bt_target:.0f}%到達率",ascending=False)
+            st.dataframe(bt_df,use_container_width=True,hide_index=True)
+            st.caption("これは銘柄ごとの過去類似シグナル集計であり、将来の勝率を保証するものではありません。サンプル件数が少ない結果は特に慎重に見てください。")
+        else:
+            st.info("現在の取得期間では十分な過去シグナルがありません。株価をさかのぼる期間を1年または2年にすると検証件数が増えます。")
 
         st.subheader("📱 AI式｜楽天証券での買い方")
         st.caption("セットアップごとに、逆指値の使い方・買いトリガー・約定後の損切り参考値を文章化します。これは自動発注ではありません。")
@@ -741,16 +978,24 @@ if st.session_state.run_scan_v10:
         st.warning("逆指値はトリガー到達＝約定保証ではありません。指値は急騰時に約定しない可能性、成行は想定より不利な価格で約定する可能性があります。")
 
         tabs=st.tabs(["🔥 ブレイク準備中","🎯 押し目","🚀 ブレイク直後","💹 決算加速","📊 6要素の内訳"])
-        setup_filters=[
-            "🔥 ブレイク準備中","🎯 押し目・75日線接近","🚀 ブレイク直後","💹 決算加速"
+
+        tab_specs = [
+            ("🔥 ブレイク準備中", lambda df: df[df["追加シグナル"].str.contains("🔥 ブレイク準備中", na=False)]),
+            ("🎯 押し目", lambda df: df[df["追加シグナル"].str.contains("🎯 押し目", na=False)]),
+            ("🚀 ブレイク直後", lambda df: df[df["追加シグナル"].str.contains("🚀 ブレイク直後", na=False)]),
+            ("💹 決算加速", lambda df: df[(df["C"] == True) & (df["20日騰落率%"] > 0)]),
         ]
-        for tab,name in zip(tabs[:4],setup_filters):
+        for tab,(label,fn) in zip(tabs[:4],tab_specs):
             with tab:
-                x=tech[tech["セットアップ"]==name]
-                if x.empty: st.info("該当なし")
+                x=fn(tech)
+                if x.empty:
+                    st.info("該当なし")
                 else:
-                    st.dataframe(x.head(50)[["順位","銘柄","Yahoo!チャート","AI式総合","上昇力","今の買いやすさ","買いトリガー","損切り参考","AI式診断"]],use_container_width=True,hide_index=True,
-                        column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗")})
+                    st.dataframe(
+                        x.head(50)[["順位","銘柄","Yahoo!チャート","AI式総合","上昇力","今の買いやすさ","セットアップ","追加シグナル","買いトリガー","損切り参考","AI式診断"]],
+                        use_container_width=True,hide_index=True,
+                        column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗")}
+                    )
         with tabs[4]:
             st.dataframe(
                 tech.head(100)[["順位","銘柄","トレンド","需給・出来高","モメンタム","業績","エントリー","リスク","75日線_乖離率%","出来高_20日平均比","20日騰落率%","60日騰落率%"]],
@@ -758,7 +1003,7 @@ if st.session_state.run_scan_v10:
             )
 
         csv=tech.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("📥 AI式ランキングをCSV保存",csv,f"AI式ランキング_{market}.csv","text/csv",use_container_width=True)
+        st.download_button("📥 AI式ランキングをCSV保存",csv,f"AI式ランキング_{market_label}.csv","text/csv",use_container_width=True)
 
 st.divider()
-st.caption("v11は1つのStreamlit URL・1つのGitHubリポジトリで2モードを切り替え、AI式にも楽天証券向け注文コメントを表示します。AI式モードは生成AIではなく独自統合ルールです。投資判断・将来の値上がりを保証しません。")
+st.caption("v13は複数市場・決算加速に加え、市場地合い判定、決算日警告、AI式上位銘柄の簡易バックテストを追加しました。AI式モードは生成AIではなく独自統合ルールです。投資判断・将来の値上がりを保証しません。")
