@@ -12,7 +12,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.5",
+    page_title="短期上昇株ハンター v19.6.1",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -327,7 +327,7 @@ def select_market_universe(all_u, market):
 # ------------------------------------------------------------
 # Yahoo Finance 株価
 # ------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def download_batch(tickers, period):
     out = {}
     tickers = list(tickers)
@@ -340,6 +340,7 @@ def download_batch(tickers, period):
                 interval="1d",
                 group_by="ticker",
                 auto_adjust=False,
+                repair=True,
                 progress=False,
                 threads=True,
             )
@@ -363,6 +364,36 @@ def download_batch(tickers, period):
         except Exception:
             pass
     return out
+
+@st.cache_data(ttl=120, show_spinner=False)
+def latest_jp_market_date():
+    try:
+        d=yf.Ticker("^N225").history(period="10d",interval="1d",auto_adjust=False,repair=True)
+        if d is None or d.empty: return None
+        return pd.Timestamp(d.index[-1]).tz_localize(None).date()
+    except Exception: return None
+
+def _frame_last_date(d):
+    try: return pd.Timestamp(d.dropna(how="all").index[-1]).tz_localize(None).date()
+    except Exception: return None
+
+def refresh_lagging_tickers(data,tickers,market_date):
+    if market_date is None: return data,[]
+    lag=[t for t in tickers if data.get(t) is None or _frame_last_date(data.get(t)) is None or _frame_last_date(data.get(t)) < market_date]
+    for t in lag:
+        try:
+            f=yf.Ticker(t).history(period="10d",interval="1d",auto_adjust=False,repair=True)
+            if f is None or f.empty: continue
+            keep=[x for x in ["Open","High","Low","Close","Adj Close","Volume"] if x in f.columns]
+            f=f[keep].copy(); f.index=pd.to_datetime(f.index).tz_localize(None)
+            old=data.get(t)
+            if old is not None and not old.empty:
+                old=old.copy(); old.index=pd.to_datetime(old.index).tz_localize(None)
+                f=pd.concat([old,f]).sort_index(); f=f[~f.index.duplicated(keep="last")]
+            data[t]=f
+        except Exception: pass
+    still=[t for t in tickers if data.get(t) is None or _frame_last_date(data.get(t)) is None or _frame_last_date(data.get(t)) < market_date]
+    return data,still
 
 # ------------------------------------------------------------
 # A/B/D
@@ -399,6 +430,13 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     d["ATR14"] = tr.rolling(14).mean()
 
     x, p = d.iloc[-1], d.iloc[-2]
+    try:
+        data_last_date = pd.Timestamp(d.index[-1]).tz_localize(None).date()
+    except Exception:
+        try:
+            data_last_date = pd.Timestamp(d.index[-1]).date()
+        except Exception:
+            data_last_date = None
     vals = [x.Close,x.High,x.MA25,x.MA75,x.OLD,x.DEV,x.R5,x.R20,x.R60]
     if not all(np.isfinite(float(v)) for v in vals):
         return None
@@ -478,6 +516,7 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     b_stop = (bh - b_stop_buffer) if np.isfinite(bh) and np.isfinite(b_stop_buffer) else np.nan
 
     return {
+        "データ最終日":data_last_date,
         "株価":close, "前日終値":prev_close, "前日比":day_change, "前日比%":day_change_pct,
         "始値":open_today, "高値":high_today, "安値":low_today, "75日線":ma75,
         "75日線_比較期間前比%":slope, "75日線_乖離率%":dev,
@@ -498,6 +537,131 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
         "B初期損切り":b_stop,
         "D":D, "Dスコア":Ds, "D買い価格":bd_buy,
     }
+
+
+# ------------------------------------------------------------
+# v19.6.1 銘柄診断・データ鮮度
+# ------------------------------------------------------------
+def business_day_age(last_date):
+    """今日までの平日ベースの概算経過日数。祝日は考慮しないため警告用の目安。"""
+    if last_date is None or pd.isna(last_date):
+        return None
+    try:
+        today = pd.Timestamp.now(tz="Asia/Tokyo").date()
+    except Exception:
+        today = pd.Timestamp.now().date()
+    try:
+        a = pd.Timestamp(last_date).date()
+        if a >= today:
+            return 0
+        return max(0, len(pd.bdate_range(pd.Timestamp(a) + pd.Timedelta(days=1), pd.Timestamp(today))))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ticker_diagnostic_data(ticker, period="1y"):
+    """
+    指定銘柄を個別再取得。
+    yfinance の end は排他的なので、明示的な日付指定を使う場合は翌日まで取る設計にする。
+    ここでは period 指定で最新日足を取り直す。
+    """
+    try:
+        d = yf.download(
+            ticker, period=period, interval="1d",
+            auto_adjust=False, repair=True,
+            progress=False, threads=False
+        )
+        if d is None or d.empty:
+            return None
+        if isinstance(d.columns, pd.MultiIndex):
+            # 単一銘柄でもMultiIndexになるyfinance版への対策
+            if ticker in set(d.columns.get_level_values(-1)):
+                d = d.xs(ticker, axis=1, level=-1)
+            else:
+                d.columns = d.columns.get_level_values(0)
+        return d.dropna(how="all")
+    except Exception:
+        return None
+
+
+def diagnose_ai_ticker(ticker, universe, tech, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy_ticks):
+    """
+    指定銘柄が独自短期ランキングにいる/いない理由を診断する。
+    ランキング本体とは独立して個別再取得し、順位圏外・データ取得・条件を切り分ける。
+    """
+    ticker = str(ticker).strip().upper()
+    if ticker.isdigit():
+        ticker += ".T"
+
+    u = universe[universe["ticker"].astype(str).str.upper() == ticker]
+    universe_hit = not u.empty
+    name = u.iloc[0]["銘柄"] if universe_hit else ticker
+
+    existing = tech[tech["ticker"].astype(str).str.upper() == ticker] if tech is not None and not tech.empty else pd.DataFrame()
+    rank = int(existing.iloc[0]["順位"]) if (not existing.empty and "順位" in existing.columns) else None
+
+    d = fetch_ticker_diagnostic_data(ticker)
+    if d is None or d.empty:
+        return {
+            "銘柄": name, "ticker": ticker, "市場対象": universe_hit,
+            "個別再取得": False, "現在順位": rank,
+            "表示されない主因": "株価日足を個別再取得できませんでした。",
+        }
+
+    m = technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy_ticks)
+    if not m:
+        return {
+            "銘柄": name, "ticker": ticker, "市場対象": universe_hit,
+            "個別再取得": True, "現在順位": rank,
+            "表示されない主因": "必要な日足本数またはOHLCVが不足し、technical_scanを通過できませんでした。",
+        }
+
+    pre = ai_pre_score(pd.Series(m))
+    tmp = pd.Series({**m, "C": False, "Cスコア": 0})
+    ai = ai_scores(tmp)
+
+    last_date = m.get("データ最終日")
+    age = business_day_age(last_date)
+    stale = age is not None and age >= 2
+
+    ext = m.get("Bブレイク上昇率%", np.nan)
+    slope = m.get("75日線_比較期間前比%", np.nan)
+    vr = m.get("出来高_20日平均比", np.nan)
+
+    if rank is not None:
+        reason = f"ランキングには存在します（現在 {rank}位）。" + ("上位100位外なので通常表には出ません。" if rank > 100 else "上位100位内です。")
+    elif not universe_hit:
+        reason = "現在選択している市場ユニバースの対象外です。"
+    elif stale:
+        reason = "個別再取得した日足が古いため、ランキング判定を信用できません。データ鮮度警告です。"
+    else:
+        reason = "市場対象・日足取得とも正常です。現在の全体ランキングDataFrameに存在しないため、一括取得時の欠落/取得失敗を疑います。"
+
+    breakout_price_ok = bool(np.isfinite(ext) and -3 <= ext <= 0)
+    breakout_trend_ok = bool(np.isfinite(slope) and slope > 0)
+    breakout_volume_ok = bool(np.isfinite(vr) and vr >= 1.1)
+
+    return {
+        "銘柄": name, "ticker": ticker,
+        "市場対象": universe_hit, "個別再取得": True,
+        "データ最終日": last_date, "データ平日経過": age,
+        "データ鮮度警告": stale,
+        "個別再取得株価": m.get("株価"),
+        "現在順位": rank,
+        "事前スコア参考": pre,
+        "短期総合スコア参考": ai.get("短期総合スコア"),
+        "セットアップ参考": ai.get("セットアップ"),
+        "直近高値との差%": ext,
+        "75日線傾き%": slope,
+        "出来高20日平均比": vr,
+        "ブレイク距離条件(-3〜0%)": breakout_price_ok,
+        "75日線上向き": breakout_trend_ok,
+        "出来高1.1倍以上": breakout_volume_ok,
+        "ブレイク準備3条件": breakout_price_ok and breakout_trend_ok and breakout_volume_ok,
+        "表示されない主因": reason,
+    }
+
 
 # ------------------------------------------------------------
 # C
@@ -1247,13 +1411,13 @@ def mode_cache_key(mode_name, selected_markets):
 
 def get_mode_cache(mode_name, selected_markets):
     key = mode_cache_key(mode_name, selected_markets)
-    return st.session_state.get("scan_cache_v195", {}).get(key)
+    return st.session_state.get("scan_cache_v1961", {}).get(key)
 
 def set_mode_cache(mode_name, selected_markets, payload):
-    if "scan_cache_v195" not in st.session_state:
-        st.session_state.scan_cache_v195 = {}
+    if "scan_cache_v1961" not in st.session_state:
+        st.session_state.scan_cache_v1961 = {}
     key = mode_cache_key(mode_name, selected_markets)
-    st.session_state.scan_cache_v195[key] = payload
+    st.session_state.scan_cache_v1961[key] = payload
 
 def cache_age_text(ts):
     if ts is None:
@@ -1834,7 +1998,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.5")
+st.title("🎯 短期上昇株ハンター v19.6.1")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -2032,8 +2196,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
-if "scan_cache_v195" not in st.session_state:
-    st.session_state.scan_cache_v195 = {}
+if "scan_cache_v1961" not in st.session_state:
+    st.session_state.scan_cache_v1961 = {}
 if "holdings_v18" not in st.session_state:
     st.session_state.holdings_v18 = []
 if "last_individual_v18" not in st.session_state:
@@ -2200,11 +2364,14 @@ cache_payload = get_mode_cache(mode, selected_markets)
 btn1, btn2 = st.columns([4,1])
 with btn1:
     if st.button(f"🚀 {market_label}をスキャン", type="primary", use_container_width=True, disabled=not selected_markets):
+        download_batch.clear()
+        latest_jp_market_date.clear()
+        fetch_ticker_diagnostic_data.clear()
         st.session_state.run_scan_v10=True
 with btn2:
     if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
         key = mode_cache_key(mode, selected_markets)
-        st.session_state.scan_cache_v195.pop(key, None)
+        st.session_state.scan_cache_v1961.pop(key, None)
         cache_payload = None
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
@@ -2239,7 +2406,7 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
     elif cached_mode == "ai":
         tech = cache_payload["tech"].copy()
         st.subheader("📊 実戦ランキング")
-        st.caption("前回スキャン結果を表示しています。モード切替では再取得しません。")
+        st.warning("⏸️ 前回スキャン結果を表示中です。株価は自動更新されません。最新日足で判定するには「スキャン」を押してください。")
         st.dataframe(
             safe_columns(tech.head(100), ["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]),
             use_container_width=True,hide_index=True,
@@ -2256,7 +2423,7 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
     elif cached_mode == "long":
         long_df = cache_payload["long_df"].copy()
         st.subheader("🏦 長期・年初来安値｜総合候補")
-        st.caption("前回スキャン結果を表示しています。モード切替では再取得しません。")
+        st.warning("⏸️ 前回スキャン結果を表示中です。株価は自動更新されません。最新日足で判定するには「スキャン」を押してください。")
         st.dataframe(
             long_df.head(100)[["順位","長期判定","銘柄","Yahoo!チャート","株価","前日比%","年初来安値","年初来安値日","年初来安値から%","安値接近度","企業クオリティ","配当・割安度","長期総合スコア","時価総額_億円","配当利回り%","ROE%","予想PER","PBR","長期買い方","1回目","2回目","3回目"]],
             use_container_width=True,hide_index=True,
@@ -2281,9 +2448,20 @@ if st.session_state.run_scan_v10:
     progress=st.progress(0)
     status.info(f"① {market_label}の株価データを取得しています…")
     data=download_batch(universe.ticker.tolist(),period)
+    market_data_date=latest_jp_market_date()
+    data,stale_tickers=refresh_lagging_tickers(data,universe.ticker.tolist(),market_data_date)
+    stale_set=set(stale_tickers)
+    batch_requested=len(universe); batch_received=len(data)
+    if market_data_date is not None:
+        st.info(f"📅 今回のランキング基準日：{market_data_date}（日経平均の日足最終日）")
+    else:
+        st.warning("⚠️ 日本市場の最新日を確認できません。ランキング基準日の保証ができません。")
+    if stale_tickers:
+        st.error(f"🚨 {len(stale_tickers)}銘柄が市場基準日 {market_data_date} まで更新できませんでした。古い日足では順位付けせず、今回のランキングから除外します。")
     rows=[]; total=len(universe)
 
     for i,row in universe.reset_index(drop=True).iterrows():
+        if row.ticker in stale_set: continue
         d=data.get(row.ticker)
         if d is not None:
             if mode.startswith("🏦"):
@@ -2306,6 +2484,10 @@ if st.session_state.run_scan_v10:
     if not rows:
         status.error("株価データを取得できませんでした。")
         st.stop()
+
+    if batch_received < batch_requested:
+        missing_count = batch_requested - batch_received
+        st.warning(f"⚠️ 一括株価取得：{batch_received:,}/{batch_requested:,}銘柄。{missing_count:,}銘柄は今回の一括取得でデータを受け取れませんでした。ランキング外＝条件外とは限りません。")
 
     tech=pd.DataFrame(rows)
 
@@ -2631,6 +2813,46 @@ if st.session_state.run_scan_v10:
 
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
+
+        # v19.6.1 データ鮮度監査
+        if "データ最終日" in tech.columns:
+            age_series = tech["データ最終日"].apply(business_day_age)
+            stale_count = int((age_series.fillna(999) >= 2).sum())
+            latest_dates = pd.to_datetime(tech["データ最終日"], errors="coerce").dropna()
+            if not latest_dates.empty:
+                newest = latest_dates.max().date()
+                oldest = latest_dates.min().date()
+                st.caption(f"📅 スキャン使用日足：最新 {newest} / 最古 {oldest} ｜ 2平日以上古い銘柄 {stale_count}件")
+            if stale_count:
+                st.warning(f"⚠️ {stale_count}銘柄で日足が2平日以上古い可能性があります。ランキングだけで判断せず、下の『銘柄診断』で個別再取得してください。")
+
+        with st.expander("🩺 銘柄診断｜なぜランキングにいる／消えた？", expanded=False):
+            st.caption("銘柄コードを入力すると、一括スキャンとは別にその銘柄の日足を再取得し、順位圏外・データ欠落・ブレイク条件を切り分けます。例：7752（リコー）")
+            diag_code = st.text_input("診断する銘柄コード", value="7752", key="ai_diag_ticker_v196")
+            if st.button("🔍 この銘柄を診断", key="run_ai_diag_v196"):
+                diag = diagnose_ai_ticker(
+                    diag_code, universe, tech,
+                    slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy_ticks
+                )
+                st.markdown(f"### {diag.get('銘柄', diag_code)}")
+                st.write(f"**診断結論**：{diag.get('表示されない主因','—')}")
+                d1,d2,d3,d4 = st.columns(4)
+                d1.metric("現在順位", f"{diag['現在順位']}位" if diag.get("現在順位") else "ランキング外")
+                d2.metric("個別再取得株価", f"{diag['個別再取得株価']:.1f}円" if isinstance(diag.get("個別再取得株価"), (int,float,np.integer,np.floating)) and np.isfinite(diag.get("個別再取得株価")) else "取得不可")
+                d3.metric("データ最終日", str(diag.get("データ最終日") or "不明"))
+                d4.metric("セットアップ", str(diag.get("セットアップ参考") or "—"))
+                detail = pd.DataFrame([
+                    ["市場対象", "○" if diag.get("市場対象") else "×"],
+                    ["個別日足再取得", "○" if diag.get("個別再取得") else "×"],
+                    ["データ鮮度警告", "⚠️ あり" if diag.get("データ鮮度警告") else "なし"],
+                    ["直近高値との差", f"{diag.get('直近高値との差%',np.nan):+.2f}%" if np.isfinite(diag.get("直近高値との差%",np.nan)) else "—"],
+                    ["ブレイク距離 -3〜0%", "○" if diag.get("ブレイク距離条件(-3〜0%)") else "×"],
+                    ["75日線上向き", "○" if diag.get("75日線上向き") else "×"],
+                    ["出来高 20日平均1.1倍以上", "○" if diag.get("出来高1.1倍以上") else "×"],
+                    ["🔥ブレイク準備3条件", "○" if diag.get("ブレイク準備3条件") else "×"],
+                ], columns=["確認項目","結果"])
+                st.dataframe(detail, use_container_width=True, hide_index=True)
+                st.caption("個別再取得株価も日足終値ベースで、リアルタイム株価ではありません。日中の現在値と一致しない場合があります。")
         st.dataframe(
             safe_columns(tech.head(100), ["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]),
             use_container_width=True,
