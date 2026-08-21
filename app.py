@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.2",
+    page_title="短期上昇株ハンター v19.3",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -834,6 +834,10 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
     with st.expander("🧮 新規買いの注文価格・損切り・利確の根拠"):
         st.markdown(f"**売買シナリオ：{ai['売買シナリオ']}**")
         st.markdown(f"**注文種類：{ai['注文種類']}**")
+        st.write(f"**買いの発動条件**：{ai['買い逆指値発動価格表示']}")
+        st.write(f"**発動後の買い指値**：{ai['発動後買い指値表示']}")
+        st.write(f"**損切りの発動条件**：{ai['損切り逆指値発動価格表示']}")
+        st.write(f"**発動後の売り指値**：{ai['発動後売り指値表示']}")
         st.write(f"**注文価格の根拠**：{ai['注文価格の根拠']}")
         st.write(f"**損切り価格の根拠**：{ai['損切り価格の根拠']}")
         st.write(f"**利確価格の根拠**：{ai['利確価格の根拠']}")
@@ -919,6 +923,22 @@ def practical_ranking_column_config():
             "注文価格",
             help="買い注文を出す場合の参考価格です。買い逆指値なら『○円以上になったら』の条件価格、買い指値なら『○円付近まで下がったら』の待ち価格です。"
         ),
+        "買い逆指値発動価格表示": st.column_config.TextColumn(
+            "買い｜発動条件",
+            help="買い逆指値で『株価が何円以上になったら注文を発動するか』です。通常の買い指値では『なし』と表示します。"
+        ),
+        "発動後買い指値表示": st.column_config.TextColumn(
+            "買い｜発動後の指値",
+            help="逆指値が発動したあと、実際に出す買い指値です。発動価格より設定したティック数だけ上までを許容します。この価格を超えて飛んだ場合は約定しない可能性があります。"
+        ),
+        "損切り逆指値発動価格表示": st.column_config.TextColumn(
+            "損切り｜発動条件",
+            help="保有後、株価が何円以下になったら損切り注文を発動するかです。"
+        ),
+        "発動後売り指値表示": st.column_config.TextColumn(
+            "損切り｜発動後の売り指値",
+            help="損切り逆指値が発動したあと、実際に出す売り指値です。発動価格より設定したティック数だけ下までを許容します。価格がこの指値より下へ飛んだ場合、約定しない可能性があります。"
+        ),
         "売買シナリオ": st.column_config.TextColumn(
             "売買シナリオ",
             help="『何を確認して買い、何が起きたら失敗と判断するか』を専門用語をなるべく使わずに要約します。",
@@ -975,7 +995,11 @@ def practical_ranking_explainer():
   - **📈 モメンタム継続**：60日騰落率+15%以上など、中期上昇を維持しつつ短期過熱が極端でない状態。
 - **ルール評価**：S/A/B/C等の独自段階評価。統計的な格付けではありません。
 - **注文種類**：楽天証券での参考注文。**買い逆指値＝上抜け確認、買い指値＝押し待ち**。
-- **注文価格**：その注文を出す場合の条件価格または指値候補。
+- **買い｜発動条件**：買い逆指値で「何円以上になったら注文を発動するか」。
+- **買い｜発動後の指値**：発動後に実際に出す買い指値。発動価格より設定ティック数だけ上までを許容。
+- **損切り｜発動条件**：保有後「何円以下になったら損切り注文を発動するか」。
+- **損切り｜発動後の売り指値**：発動後に実際に出す売り指値。発動価格より設定ティック数だけ下までを許容。
+- **注文価格**：従来の要約表示。v19.3では上記4列を実注文向けの主表示にします。
 - **注文価格の根拠**：ブレイク準備は「ブレイク水準＋1ティック」の買い逆指値。ブレイク直後は高値を追わず「現在値から0.75ATR程度の押し」を買い指値。75日線押し目は「前日高値＋指定ティック」を上抜けて反転確認する買い逆指値。
 - **損切り**：約定後の売り逆指値の参考値。
 - **損切り価格の根拠**：まず「買った理由が崩れる水準」を決めます。75日線押し目なら75日線の明確割れ、ブレイク系ならブレイク水準の支持失敗。ATRはブレイク系で日々のノイズを避ける補助バッファとしてのみ使用します。
@@ -1035,13 +1059,13 @@ def mode_cache_key(mode_name, selected_markets):
 
 def get_mode_cache(mode_name, selected_markets):
     key = mode_cache_key(mode_name, selected_markets)
-    return st.session_state.get("scan_cache_v173", {}).get(key)
+    return st.session_state.get("scan_cache_v193", {}).get(key)
 
 def set_mode_cache(mode_name, selected_markets, payload):
-    if "scan_cache_v173" not in st.session_state:
-        st.session_state.scan_cache_v173 = {}
+    if "scan_cache_v193" not in st.session_state:
+        st.session_state.scan_cache_v193 = {}
     key = mode_cache_key(mode_name, selected_markets)
-    st.session_state.scan_cache_v173[key] = payload
+    st.session_state.scan_cache_v193[key] = payload
 
 def cache_age_text(ts):
     if ts is None:
@@ -1402,6 +1426,16 @@ def ai_scores(r):
     stop_price_reason=""
     take_profit_reason=""
 
+    # v19.3 逆指値注文を「発動条件」と「発動後の実際の指値」に分解
+    buy_trigger_price=np.nan
+    buy_limit_price=np.nan
+    stop_trigger_price=np.nan
+    stop_limit_price=np.nan
+    buy_trigger_text="—"
+    buy_limit_text="—"
+    stop_trigger_text="—"
+    stop_limit_text="—"
+
     if chase:
         order_reason="過熱または買いやすさ不足。現在値を追いかけず、押し目形成後に再判定。"
         buy_price_reason="注文を出さないため買い価格は設定しません。75日線乖離・ブレイク後上昇率・買いやすさのいずれかが過熱側です。"
@@ -1411,12 +1445,16 @@ def ai_scores(r):
         # ブレイク前：上抜けを確認してから買うため「買い逆指値」
         buy_order_type="買い逆指値"
         buy_price=float(trigger)
-        buy_price_text=f"{buy_price:.0f}円以上"
-        buy_condition=f"株価が{buy_price:.0f}円以上になったら買い条件発動"
+        buy_trigger_price=buy_price
+        buy_limit_price=buy_trigger_price + tick_size(buy_trigger_price)*reverse_order_limit_ticks
+        buy_trigger_text=f"{buy_trigger_price:.0f}円以上"
+        buy_limit_text=f"{buy_limit_price:.0f}円"
+        buy_price_text=f"発動 {buy_trigger_text} → 指値 {buy_limit_text}"
+        buy_condition=f"株価が{buy_trigger_price:.0f}円以上になったら、{buy_limit_price:.0f}円の買い指値を発注"
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="まだブレイク前。上抜けを確認してから入る。"
-        buy_price_reason=f"直近高値（過去{breakout_days}営業日で超えられなかった高値）{float(r['Bブレイク水準']):.0f}円より、最小の値幅1つ分だけ上の {buy_price:.0f}円を条件価格にしています。つまり『{buy_price:.0f}円以上になったら買いを検討』です。安く買うための価格ではなく、直近高値を実際に突破して上昇の強さを確認するための価格です。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。"
+        buy_price_reason=f"直近高値（過去{breakout_days}営業日で超えられなかった高値）{float(r['Bブレイク水準']):.0f}円より、最小の値幅1つ分だけ上の {buy_price:.0f}円を条件価格にしています。つまり『{buy_price:.0f}円以上になったら買いを検討』です。安く買うための価格ではなく、直近高値を実際に突破して上昇の強さを確認するための価格です。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。v19.3では発動後の指値も別表示し、発動価格より{reverse_order_limit_ticks}ティック上までを買値の許容範囲にしています。"
         blevel=float(r["Bブレイク水準"])
         atr_abs=float(r["ATR14"]) if np.isfinite(r["ATR14"]) else np.nan
         buffer_abs=(blevel-stop_price)
@@ -1431,8 +1469,11 @@ def ai_scores(r):
             pullback_low=pullback_high
         buy_order_type="買い指値"
         buy_price=float(pullback_high)
+        buy_limit_price=buy_price
+        buy_trigger_text="なし（通常の買い指値）"
+        buy_limit_text=f"{buy_price:.0f}円"
         buy_price_text=f"{pullback_low:.0f}〜{pullback_high:.0f}円"
-        buy_condition=f"{buy_price_text}への押しを待つ。上に飛んだ場合は追いかけない"
+        buy_condition=f"逆指値の発動条件はなし。{buy_price_text}への押しを待ち、上に飛んだ場合は追いかけない"
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="ブレイク済み。新規の買い逆指値ではなく、押しを待つ指値買い。"
@@ -1445,8 +1486,12 @@ def ai_scores(r):
         # 条件価格は現在値より上に置くトリガーなので、買い指値ではなく買い逆指値。
         buy_order_type="買い逆指値"
         buy_price=float(r["A買い価格"])
-        buy_price_text=f"{buy_price:.0f}円以上"
-        buy_condition=f"75日線付近の押し目形成後、株価が前日高値＋指定ティックの {buy_price:.0f}円以上になったら買い条件発動"
+        buy_trigger_price=buy_price
+        buy_limit_price=buy_trigger_price + tick_size(buy_trigger_price)*reverse_order_limit_ticks
+        buy_trigger_text=f"{buy_trigger_price:.0f}円以上"
+        buy_limit_text=f"{buy_limit_price:.0f}円"
+        buy_price_text=f"発動 {buy_trigger_text} → 指値 {buy_limit_text}"
+        buy_condition=f"75日線付近の押し目形成後、株価が{buy_trigger_price:.0f}円以上になったら、{buy_limit_price:.0f}円の買い指値を発注"
         stop_order_type="売り逆指値"
         stop_price=float(r["A初期損切り"])
         order_reason="75日線付近まで押しただけでは買わず、前日高値超えで反転を確認してから入る。"
@@ -1484,22 +1529,42 @@ def ai_scores(r):
         buy_price_reason="主要セットアップの条件が不足しているため、買い価格は設定しません。"
         stop_price_reason="未約定のため損切り価格は設定しません。"
 
-    risk_base = buy_price if np.isfinite(buy_price) else np.nan
-    risk_pct=((stop_price/risk_base)-1)*100 if np.isfinite(risk_base) and np.isfinite(stop_price) and risk_base else np.nan
-    stop_price_text=f"{stop_price:.0f}円以下" if np.isfinite(stop_price) else "—"
+    # 約定後の損切り逆指値も、発動価格と発動後の売り指値を分ける。
+    if stop_order_type=="売り逆指値" and np.isfinite(stop_price):
+        stop_trigger_price=float(stop_price)
+        stop_limit_price=stop_trigger_price - tick_size(stop_trigger_price)*reverse_order_limit_ticks
+        stop_trigger_text=f"{stop_trigger_price:.0f}円以下"
+        stop_limit_text=f"{stop_limit_price:.0f}円"
+    else:
+        stop_trigger_text="—"
+        stop_limit_text="—"
+
+    # リスク計算は、逆指値買いでは発動後に許容する買い指値、
+    # 損切り側では発動後の売り指値を使い、予定上の最悪寄りで計算。
+    entry_reference = (
+        buy_limit_price if buy_order_type=="買い逆指値" and np.isfinite(buy_limit_price)
+        else buy_price
+    )
+    exit_reference = (
+        stop_limit_price if stop_order_type=="売り逆指値" and np.isfinite(stop_limit_price)
+        else stop_price
+    )
+    risk_base = entry_reference if np.isfinite(entry_reference) else np.nan
+    risk_pct=((exit_reference/risk_base)-1)*100 if np.isfinite(risk_base) and np.isfinite(exit_reference) and risk_base else np.nan
+    stop_price_text=f"発動 {stop_trigger_text} → 指値 {stop_limit_text}" if np.isfinite(stop_trigger_price) else "—"
     order_summary=f"{buy_order_type}｜{buy_price_text}｜約定後 {stop_order_type} {stop_price_text}"
     take_profit1=take_profit2=rr=reward_pct=np.nan
-    if np.isfinite(buy_price) and np.isfinite(stop_price) and buy_price > stop_price:
-        risk_yen=buy_price-stop_price
-        take_profit1=buy_price+2*risk_yen
-        take_profit2=buy_price+3*risk_yen
+    if np.isfinite(entry_reference) and np.isfinite(exit_reference) and entry_reference > exit_reference:
+        risk_yen=entry_reference-exit_reference
+        take_profit1=entry_reference+2*risk_yen
+        take_profit2=entry_reference+3*risk_yen
         rr=2.0
-        reward_pct=(take_profit1/buy_price-1)*100
+        reward_pct=(take_profit1/entry_reference-1)*100
     take_profit1_text=f"{take_profit1:.0f}円" if np.isfinite(take_profit1) else "—"
     take_profit2_text=f"{take_profit2:.0f}円" if np.isfinite(take_profit2) else "—"
-    if np.isfinite(take_profit1) and np.isfinite(buy_price) and np.isfinite(stop_price):
-        risk_yen=buy_price-stop_price
-        take_profit_reason=f"買値 {buy_price:.0f}円 と損切り {stop_price:.0f}円 の差 {risk_yen:.0f}円を1Rとし、利確①は2R、利確②は3R上に置くリスク管理上の参考値です。価格到達を予測するものではありません。"
+    if np.isfinite(take_profit1) and np.isfinite(entry_reference) and np.isfinite(exit_reference):
+        risk_yen=entry_reference-exit_reference
+        take_profit_reason=f"実際の注文で許容する買い価格 {entry_reference:.0f}円 と、損切り発動後の売り指値 {exit_reference:.0f}円 の差 {risk_yen:.0f}円を1Rとし、利確①は2R、利確②は3R上に置く参考値です。価格到達を予測するものではありません。"
     else:
         take_profit_reason="買値または損切り価格が未設定のため、利確価格も設定していません。"
     if buy_order_type in ["買い逆指値","買い指値"]:
@@ -1535,10 +1600,18 @@ def ai_scores(r):
         "注文種類":buy_order_type,
         "注文価格":buy_price,
         "注文価格表示":buy_price_text,
+        "買い逆指値発動価格":buy_trigger_price,
+        "買い逆指値発動価格表示":buy_trigger_text,
+        "発動後買い指値":buy_limit_price,
+        "発動後買い指値表示":buy_limit_text,
         "注文条件":buy_condition,
         "損切り注文":stop_order_type,
         "損切り価格":stop_price,
         "損切り価格表示":stop_price_text,
+        "損切り逆指値発動価格":stop_trigger_price,
+        "損切り逆指値発動価格表示":stop_trigger_text,
+        "発動後売り指値":stop_limit_price,
+        "発動後売り指値表示":stop_limit_text,
         "想定初期リスク%":risk_pct,
         "注文理由":order_reason,
         "売買シナリオ":(
@@ -1557,7 +1630,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.2")
+st.title("🎯 短期上昇株ハンター v19.3")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -1620,6 +1693,7 @@ with st.sidebar:
     long_max_low_dist = 10
     choruko_mcap = "5,000億円以上"
     choruko_material_default = "未確認"
+    reverse_order_limit_ticks = 3
 
     if mode.startswith("📘"):
         st.subheader("📘 本ベース設定")
@@ -1680,6 +1754,10 @@ with st.sidebar:
         c_check_count = st.slider(
             "決算を詳しく確認する上位銘柄数",30,200,100,10,
             help="何を変える？：独自短期の上位候補のうち、決算情報を詳しく取得する銘柄数です。増やすほど決算面を広く確認できますが、Yahoo Financeへの個別取得が増えるためスキャン時間も長くなります。"
+        )
+        reverse_order_limit_ticks = st.slider(
+            "逆指値発動後の指値余裕（何ティック）", 1, 10, 3, 1,
+            help="何を変える？：買い/売りの逆指値が発動したあと、実際に出す指値を発動価格から何ティック離すかです。例：1ティック=1円の銘柄で3なら、買いは発動価格+3円、損切り売りは発動価格-3円。広げるほど約定しやすくなりますが、不利な価格まで許容します。"
         )
 
         st.divider()
@@ -1753,8 +1831,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
-if "scan_cache_v173" not in st.session_state:
-    st.session_state.scan_cache_v173 = {}
+if "scan_cache_v193" not in st.session_state:
+    st.session_state.scan_cache_v193 = {}
 if "holdings_v18" not in st.session_state:
     st.session_state.holdings_v18 = []
 if "last_individual_v18" not in st.session_state:
@@ -1925,7 +2003,7 @@ with btn1:
 with btn2:
     if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
         key = mode_cache_key(mode, selected_markets)
-        st.session_state.scan_cache_v173.pop(key, None)
+        st.session_state.scan_cache_v193.pop(key, None)
         cache_payload = None
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
@@ -1962,14 +2040,14 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
         st.subheader("📊 実戦ランキング")
         st.caption("前回スキャン結果を表示しています。モード切替では再取得しません。")
         st.dataframe(
-            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],
+            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]],
             use_container_width=True,hide_index=True,
             column_config=practical_ranking_column_config()
         )
         practical_ranking_explainer()
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,hide_index=True
             )
         st.stop()
@@ -2353,16 +2431,16 @@ if st.session_state.run_scan_v10:
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
         st.dataframe(
-            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],
+            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]],
             use_container_width=True,
             hide_index=True,
             column_config=practical_ranking_column_config()
         )
         practical_ranking_explainer()
-        st.warning("買い逆指値＝上抜け確認、買い指値＝押し待ち、売り逆指値＝約定後の損切り。株価データはリアルタイム保証ではありません。")
+        st.warning("逆指値は『発動条件』と『発動後の指値』を別々に表示しています。指値付き逆指値は価格が指値を飛び越えると約定しない場合があります。呼値はアプリ内の簡易計算なので、最終入力時は楽天証券の注文画面でも確認してください。株価データはリアルタイム保証ではありません。")
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
