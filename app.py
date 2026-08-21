@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v18.0.3",
+    page_title="短期上昇株ハンター v19",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -575,6 +575,98 @@ def long_buy_plan(r):
 
 
 
+
+
+
+# ------------------------------------------------------------
+# v19 ちょる子式｜大型株逆張り
+# ------------------------------------------------------------
+def calc_rci(close, period=9):
+    s=pd.Series(close).astype(float)
+    out=pd.Series(index=s.index,dtype=float)
+    if len(s)<period:
+        return out
+    date_rank=np.arange(1,period+1,dtype=float)
+    for i in range(period-1,len(s)):
+        w=s.iloc[i-period+1:i+1]
+        price_rank=w.rank(method="average").to_numpy(dtype=float)
+        d=date_rank-price_rank
+        out.iloc[i]=(1-6*np.sum(d*d)/(period*(period*period-1)))*100
+    return out
+
+def choruko_metrics(d):
+    try:
+        x=d.copy()
+        if isinstance(x.columns,pd.MultiIndex):
+            x.columns=x.columns.get_level_values(0)
+        need=["Open","High","Low","Close","Volume"]
+        if not all(c in x.columns for c in need):
+            return None
+        x=x[need].dropna().copy()
+        if len(x)<40:
+            return None
+        x["MA25"]=x.Close.rolling(25).mean()
+        sd=x.Close.rolling(25).std(ddof=0)
+        x["BB_Z"]=(x.Close-x.MA25)/sd.replace(0,np.nan)
+        x["RCI9"]=calc_rci(x.Close,9)
+        x["V20"]=x.Volume.rolling(20).mean()
+
+        cur=x.iloc[-1]; prev=x.iloc[-2]
+        close=float(cur.Close); prev_close=float(prev.Close)
+        day_pct=(close/prev_close-1)*100 if prev_close else np.nan
+        ma25=float(cur.MA25) if np.isfinite(cur.MA25) else np.nan
+        dev25=(close/ma25-1)*100 if np.isfinite(ma25) and ma25 else np.nan
+        bbz=float(cur.BB_Z) if np.isfinite(cur.BB_Z) else np.nan
+        rci=float(cur.RCI9) if np.isfinite(cur.RCI9) else np.nan
+
+        s1=np.isfinite(day_pct) and day_pct<=-2.5
+        # 「25日線を大きく割り込む」の厳密な％は手元資料では不明。
+        # 本ルールとして勝手な乖離閾値を追加せず、25日線より下か＋乖離率を表示。
+        s2=np.isfinite(dev25) and dev25<0
+        s3=np.isfinite(bbz) and bbz<=-3.0
+        s4=np.isfinite(rci) and rci<=-90.0
+        count=int(s1)+int(s2)+int(s3)+int(s4)
+
+        # アプリ独自補助：陽線化または前日高値突破
+        reversal=(close>float(cur.Open)) or (close>float(prev.High))
+
+        return {
+            "株価":close,"現在値":close,"前日終値":prev_close,"前日比%":day_pct,
+            "25日線":ma25,"25日線乖離%":dev25,"BBσ":bbz,"RCI9":rci,
+            "急落-2.5%":bool(s1),"25日線割れ":bool(s2),"BB-3σ":bool(s3),"RCI-90":bool(s4),
+            "底打ち条件数":count,"反転確認_独自":bool(reversal),"急落前水準":prev_close,
+        }
+    except Exception:
+        return None
+
+def choruko_judgment(r, material_status):
+    n=int(r.get("底打ち条件数",0))
+    rev=bool(r.get("反転確認_独自",False))
+    if material_status=="悪材料あり":
+        return "🔴 対象外","悪材料あり。『材料なし急落』の前提から外れます。"
+    if n==4 and rev and material_status=="悪材料なし確認済":
+        return "🟢 最有力候補","4/4条件＋反転確認＋悪材料なし確認済。"
+    if n>=3:
+        return "🟡 逆張り候補",f"{n}/4条件。材料確認と反転確認を優先。"
+    if n>=2:
+        return "🟠 監視",f"{n}/4条件。売られすぎ条件がまだ不足。"
+    return "⚪ 対象外寄り",f"{n}/4条件のみ。"
+
+def choruko_exit_plan(r):
+    close=float(r["現在値"])
+    ma25=float(r["25日線"]) if np.isfinite(r.get("25日線",np.nan)) else np.nan
+    prev=float(r["急落前水準"]) if np.isfinite(r.get("急落前水準",np.nan)) else np.nan
+    candidates=[]
+    if np.isfinite(ma25) and ma25>close: candidates.append(("25日線回帰",ma25))
+    if np.isfinite(prev) and prev>close: candidates.append(("急落前終値回帰",prev))
+    candidates=sorted(candidates,key=lambda x:x[1])
+    return {
+        "利確参考①":candidates[0][1] if len(candidates)>0 else np.nan,
+        "利確参考①根拠":candidates[0][0] if len(candidates)>0 else "—",
+        "利確参考②":candidates[1][1] if len(candidates)>1 else np.nan,
+        "利確参考②根拠":candidates[1][0] if len(candidates)>1 else "—",
+        "損切り方針":"反発せず、買った前提（支持・反転）が崩れたら損切りを再判断。",
+    }
 
 
 # ------------------------------------------------------------
@@ -1436,17 +1528,17 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v18.0.3")
+st.title("🎯 短期上昇株ハンター v19")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
     "分析モード",
-    ["📘 本ベース A/B/C/D", "🧪 独自短期・独自統合スクリーナー", "🏦 長期・年初来安値", "🔎 保有銘柄・個別分析"],
+    ["📘 本ベース A/B/C/D", "🧪 独自短期・独自統合スクリーナー", "🏦 長期・年初来安値", "📕 ちょる子式｜大型株逆張り", "🔎 保有銘柄・個別分析"],
     horizontal=True,
     help="ランキング3モードに加えて、買った銘柄を保有者目線で個別分析・管理できます。"
 )
 
-with st.expander("ℹ️ 4つのモードの違い"):
+with st.expander("ℹ️ 5つのモードの違い"):
     st.markdown("""
 **📘 本ベース A/B/C/D**  
 これまで育ててきたロジックです。Aは参考書の「75日線が上向き・株価は75日線より下・75日線上抜けで買う」を中心にしています。B/C/Dは補助戦略です。
@@ -1468,6 +1560,11 @@ with st.expander("ℹ️ 4つのモードの違い"):
 年初来安値に近い銘柄を探しつつ、**安いだけでは買わない**長期モードです。  
 時価総額・ROE・利益率・成長率・配当・PER/PBRなど、取得できるファンダメンタルを合わせて「長期候補 / 分割買い候補 / 安い理由を要確認」を判定します。  
 短期売買とは混ぜず、長期の分割購入を前提に表示します。
+
+**📕 ちょる子式｜大型株逆張り**  
+読書メモと確認できた書評を基礎にした大型株逆張りモードです。  
+前日比-2.5%以上、25日線割れ、BB-3σ、RCI-90以下を個別に表示します。  
+「材料なし」は株価だけで断定しないため、未確認/確認済/悪材料ありを分けます。反転確認は🤖アプリ独自補助です。
 
 **🔎 保有銘柄・個別分析**  
 銘柄コード・取得単価・保有株数を入れて、**新規で買う判断とは別に、保有者として継続・注意・一部利確・トレンド崩れを判定**します。  
@@ -1492,6 +1589,8 @@ with st.sidebar:
     long_fund_n = 80
     long_mcap_filter = "5,000億円以上"
     long_max_low_dist = 10
+    choruko_mcap = "5,000億円以上"
+    choruko_material_default = "未確認"
 
     if mode.startswith("📘"):
         st.subheader("📘 本ベース設定")
@@ -1599,6 +1698,18 @@ with st.sidebar:
             help="何を変える？：現在値が年初来安値から何％以内なら『安値に近い』候補として重点表示するかです。小さくすると年初来安値ギリギリの銘柄に厳しく絞り、大きくすると候補範囲を広げます。例：10%なら年初来安値から10%以内です。"
         )
 
+    elif mode.startswith("📕"):
+        st.subheader("📕 ちょる子式設定")
+        st.info("本由来の4条件は固定表示し、閾値を勝手に変更しない設計です。")
+        choruko_mcap = st.selectbox(
+            "大型株フィルター",["1,000億円以上","5,000億円以上","1兆円以上"],index=1,
+            help="対象とする最低時価総額です。読書メモの『大型株中心』をアプリ側で具体化した補助条件です。"
+        )
+        choruko_material_default = st.selectbox(
+            "材料確認の初期状態",["未確認","悪材料なし確認済","悪材料あり"],index=0,
+            help="『材料なし』は株価だけでは判定できません。ニュース・適時開示等を確認した場合のみ変更してください。"
+        )
+
     elif mode.startswith("🔎"):
         st.subheader("🔎 個別分析設定")
         st.info("個別分析では左側の細かいスキャン設定は不要です。銘柄コード・取得単価・保有株数はメイン画面で入力します。分析には1年分の日足を使用します。")
@@ -1681,6 +1792,27 @@ if mode.startswith("🔎"):
 
     st.warning("個別分析は売買を自動執行する機能ではありません。『新規買い評価』と『保有者としての評価』を意図的に分けています。")
     st.stop()
+
+if mode.startswith("📕"):
+    st.subheader("📕 ちょる子式｜大型株逆張り")
+    st.caption("📕＝読書メモ＋確認済み書評 / 🤖＝アプリ独自補助。両者を混ぜずに表示します。")
+    with st.expander("📚 判定条件と注意点"):
+        st.markdown("""
+**📕 4つの売られすぎ条件**
+1. 材料なしで前日終値比 **-2.5%以上**
+2. **25日線を下回る**（『大きく割り込む』の厳密％は資料で確定できないため乖離率を併記）
+3. ボリンジャーバンド **-3σ以下**
+4. RCI **-90以下**
+
+**🤖 アプリ独自補助**
+- 前日高値突破または陽線化を反転確認として表示
+- 時価総額で大型株を絞り込み
+- 「材料なし」は自動断定しない
+
+**出口参考**
+- 25日線への回帰
+- 急落前終値への回帰
+""")
 
 st.subheader("🏢 スキャンする市場")
 st.caption("複数選択できます。例：プライム＋スタンダード。初期設定はプライムのみです。")
@@ -1847,8 +1979,9 @@ if st.session_state.run_scan_v10:
         d=data.get(row.ticker)
         if d is not None:
             if mode.startswith("🏦"):
-                # 長期モードでは短期テクニカル計算を省略し、年初来安値計算だけ実施。
                 r=long_price_metrics(d)
+            elif mode.startswith("📕"):
+                r=choruko_metrics(d)
             else:
                 r=technical_scan(d,slope_days,max_dev,breakout_days,a_stop_buffer_pct,buy_ticks)
 
@@ -1872,8 +2005,9 @@ if st.session_state.run_scan_v10:
     if mode.startswith("📘"):
         tech["事前スコア"]=tech["Aスコア"]*.375+tech["Bスコア"]*.3125+tech["Dスコア"]*.3125
     elif mode.startswith("🏦"):
-        # 長期ではまず年初来安値への接近を優先。
         tech["事前スコア"]=tech["安値接近度"].fillna(0)
+    elif mode.startswith("📕"):
+        tech["事前スコア"]=tech["底打ち条件数"]*25
     else:
         tech["事前スコア"]=tech.apply(ai_pre_score,axis=1)
 
@@ -2010,6 +2144,63 @@ if st.session_state.run_scan_v10:
         )
 
         st.warning("長期モードは『年初来安値だから買う』機能ではありません。業績悪化・減配・構造的な競争力低下などで安値になっている可能性があります。分割購入案は参考値で、損失を限定するものではありません。")
+        st.stop()
+
+    if mode.startswith("📕"):
+        status.info("② 大型株候補の時価総額を確認しています…")
+        threshold={"1,000億円以上":1000,"5,000億円以上":5000,"1兆円以上":10000}[choruko_mcap]
+        candidates=tech.sort_values(["底打ち条件数","前日比%"],ascending=[False,True]).head(min(120,len(tech))).copy()
+        fmap=parallel_fetch(candidates.ticker.tolist(),long_term_fundamentals,max_workers=6)
+        candidates["時価総額_億円"]=[fmap.get(t,{}).get("時価総額_億円",np.nan) for t in candidates.ticker]
+        candidates=candidates[candidates["時価総額_億円"].fillna(-1)>=threshold].copy()
+        candidates["材料確認"]=choruko_material_default
+
+        vals=[]
+        for _,rr in candidates.iterrows():
+            j,reason=choruko_judgment(rr,choruko_material_default)
+            p=choruko_exit_plan(rr)
+            x={"判定":j,"判定理由":reason,**p}
+            vals.append(x)
+        extra=pd.DataFrame(vals,index=candidates.index)
+        candidates=pd.concat([candidates,extra],axis=1)
+        candidates=candidates.sort_values(["底打ち条件数","反転確認_独自","前日比%"],ascending=[False,False,True]).reset_index(drop=True)
+        candidates.insert(0,"順位",np.arange(1,len(candidates)+1))
+        progress.progress(1.0); progress.empty()
+        status.success("ちょる子式候補を作成しました。")
+
+        st.subheader("📕 ちょる子式｜大型株逆張りランキング")
+        st.caption("4条件を個別表示します。『材料なし』は自動断定せず、既定は未確認です。4/4でも即買い判定ではありません。")
+        if candidates.empty:
+            st.info("現在の大型株フィルターでは候補がありません。")
+            st.stop()
+
+        st.dataframe(
+            candidates[["順位","判定","銘柄","Yahoo!チャート","現在値","前日比%","急落-2.5%","25日線乖離%","25日線割れ","BBσ","BB-3σ","RCI9","RCI-90","底打ち条件数","材料確認","反転確認_独自","時価総額_億円","利確参考①","利確参考①根拠","利確参考②","利確参考②根拠"]],
+            use_container_width=True,hide_index=True,
+            column_config={
+                "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
+                "現在値":st.column_config.NumberColumn("現在値",format="%.0f円"),
+                "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
+                "25日線乖離%":st.column_config.NumberColumn("25日線乖離",format="%+.2f%%"),
+                "BBσ":st.column_config.NumberColumn("BB位置",format="%.2fσ"),
+                "RCI9":st.column_config.NumberColumn("RCI(9)",format="%.1f"),
+                "時価総額_億円":st.column_config.NumberColumn("時価総額",format="%.0f億円"),
+                "利確参考①":st.column_config.NumberColumn("利確①",format="%.0f円"),
+                "利確参考②":st.column_config.NumberColumn("利確②",format="%.0f円"),
+            }
+        )
+        with st.expander("❓ 各列の意味"):
+            st.markdown("""
+- **急落-2.5%**：前日終値比-2.5%以上なら○
+- **25日線乖離 / 25日線割れ**：25日線より下かと、どの程度離れたか
+- **BB位置 / BB-3σ**：ボリンジャーバンド上の標準偏差位置
+- **RCI(9) / RCI-90**：9日RCI。-90以下なら○
+- **底打ち条件数**：4条件中の該当数。4/4でも即買いではありません
+- **材料確認**：自動ニュース判定ではありません
+- **反転確認_独自**：🤖陽線化または前日高値突破
+- **利確①/②**：📕25日線・急落前終値への平均回帰を参考
+""")
+        st.warning("『-2.5%下がったら買い』機能ではありません。大型株・売られすぎ・材料・反転を分けて確認します。")
         st.stop()
 
     n=min(c_check_count,len(tech))
