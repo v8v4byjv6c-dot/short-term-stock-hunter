@@ -1,7 +1,6 @@
 
 import io
 import re
-import math
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -12,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.5",
+    page_title="短期上昇株ハンター v19.3",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -41,182 +40,6 @@ def tick_size(price):
     if price < 50000: return 50
     if price < 100000: return 100
     return 100
-
-def adaptive_limit_buffer(price, atr_yen):
-    """逆指値発動後の指値許容幅。固定ティックではなく値動きに合わせて自動計算。"""
-    tick = tick_size(price)
-    atr_part = 0.15 * atr_yen if np.isfinite(atr_yen) and atr_yen > 0 else price * 0.003
-    raw = max(2 * tick, min(atr_part, price * 0.003))
-    return math.ceil(raw / tick) * tick
-
-
-def candidate_limit_buffer(price, atr_yen, policy):
-    """逆指値発動後の買い指値許容幅を比較検証する候補式。"""
-    tick = tick_size(price)
-    floor = 2 * tick
-
-    if policy == "2ティック固定":
-        raw = floor
-    elif policy == "0.10%":
-        raw = max(floor, price * 0.001)
-    elif policy == "0.20%":
-        raw = max(floor, price * 0.002)
-    elif policy == "0.30%":
-        raw = max(floor, price * 0.003)
-    elif policy == "0.10ATR・上限0.30%":
-        atr_part = 0.10 * atr_yen if np.isfinite(atr_yen) and atr_yen > 0 else price * 0.003
-        raw = max(floor, min(atr_part, price * 0.003))
-    elif policy == "現行 0.15ATR・上限0.30%":
-        atr_part = 0.15 * atr_yen if np.isfinite(atr_yen) and atr_yen > 0 else price * 0.003
-        raw = max(floor, min(atr_part, price * 0.003))
-    elif policy == "0.20ATR・上限0.30%":
-        atr_part = 0.20 * atr_yen if np.isfinite(atr_yen) and atr_yen > 0 else price * 0.003
-        raw = max(floor, min(atr_part, price * 0.003))
-    else:
-        raw = adaptive_limit_buffer(price, atr_yen)
-
-    return math.ceil(raw / tick) * tick
-
-
-def backtest_breakout_limit_buffer(d, slope_days=20, breakout_days=60):
-    """
-    ブレイク準備中の過去シグナルから、逆指値発動後の指値許容幅を検証。
-    日足OHLCによる推定であり、板・瞬間的な価格飛びは完全再現できない。
-    """
-    if d is None or len(d) < max(120, breakout_days + 80):
-        return None
-
-    x = d.copy()
-    for c in ["Open","High","Low","Close","Volume"]:
-        if c in x.columns and isinstance(x[c], pd.DataFrame):
-            x[c] = x[c].iloc[:,0]
-    x = x.dropna(subset=["Open","High","Low","Close","Volume"]).copy()
-    if len(x) < max(120, breakout_days + 80):
-        return None
-
-    prev_close = x.Close.shift(1)
-    tr = pd.concat([
-        x.High - x.Low,
-        (x.High - prev_close).abs(),
-        (x.Low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    x["ATR14"] = tr.rolling(14).mean()
-
-    x["MA75"] = x.Close.rolling(75).mean()
-    x["Slope75"] = (x.MA75 / x.MA75.shift(slope_days) - 1) * 100
-    x["V20"] = x.Volume.rolling(20).mean()
-    x["VR"] = x.Volume / x.V20
-    x["PrevHigh"] = x.High.shift(1).rolling(breakout_days).max()
-    x["Ext"] = (x.Close / x.PrevHigh - 1) * 100
-
-    prep = (
-        (x.Slope75 > 0) &
-        (x.Ext >= -3) & (x.Ext < 0) &
-        (x.VR >= 1.1) &
-        x.PrevHigh.notna() &
-        x.ATR14.notna()
-    )
-
-    records = []
-    idx_positions = np.where(prep.fillna(False).to_numpy())[0]
-    last_signal_pos = -999
-
-    for p in idx_positions:
-        if p - last_signal_pos < 5:
-            continue
-        if p + 1 >= len(x):
-            continue
-
-        signal = x.iloc[p]
-        nxt = x.iloc[p+1]
-        trigger = float(signal.PrevHigh) + tick_size(float(signal.PrevHigh))
-        atr = float(signal.ATR14)
-
-        if float(nxt.High) < trigger:
-            last_signal_pos = p
-            continue
-
-        open_gap = max(0.0, float(nxt.Open) - trigger)
-        required_pct = (open_gap / trigger) * 100 if trigger else np.nan
-
-        rec = {
-            "trigger": trigger,
-            "atr": atr,
-            "open": float(nxt.Open),
-            "high": float(nxt.High),
-            "low": float(nxt.Low),
-            "required_buffer_yen": open_gap,
-            "required_buffer_pct": required_pct,
-        }
-
-        for policy in [
-            "2ティック固定","0.10%","0.20%","0.30%",
-            "0.10ATR・上限0.30%","現行 0.15ATR・上限0.30%","0.20ATR・上限0.30%"
-        ]:
-            buf = candidate_limit_buffer(trigger, atr, policy)
-            limit = trigger + buf
-            if float(nxt.Open) >= trigger:
-                immediate = float(nxt.Open) <= limit
-                estimated_fill = immediate or (float(nxt.Low) <= limit)
-            else:
-                immediate = True
-                estimated_fill = True
-
-            rec[f"{policy}__buffer"] = buf
-            rec[f"{policy}__immediate"] = bool(immediate)
-            rec[f"{policy}__fill"] = bool(estimated_fill)
-
-        records.append(rec)
-        last_signal_pos = p
-
-    if not records:
-        return None
-    return pd.DataFrame(records)
-
-
-def summarize_buffer_backtests(frames):
-    """複数銘柄の逆指値バッファ検証を集約。"""
-    frames = [f for f in frames if f is not None and not f.empty]
-    if not frames:
-        return None, None
-
-    bt = pd.concat(frames, ignore_index=True)
-    policies = [
-        "2ティック固定","0.10%","0.20%","0.30%",
-        "0.10ATR・上限0.30%","現行 0.15ATR・上限0.30%","0.20ATR・上限0.30%"
-    ]
-
-    rows = []
-    for policy in policies:
-        buf = bt[f"{policy}__buffer"]
-        imm = bt[f"{policy}__immediate"]
-        fill = bt[f"{policy}__fill"]
-        rows.append({
-            "方式": policy,
-            "発動件数": int(len(bt)),
-            "寄付き即時約定率%": float(imm.mean()*100),
-            "日中推定約定率%": float(fill.mean()*100),
-            "平均許容幅円": float(buf.mean()),
-            "平均許容幅%": float((buf / bt["trigger"] * 100).mean()),
-            "指値超え寄付き率%": float((bt["open"] > (bt["trigger"] + buf)).mean()*100),
-        })
-
-    summary = pd.DataFrame(rows)
-    eligible = summary[summary["日中推定約定率%"] >= 95].copy()
-    if not eligible.empty:
-        recommended = eligible.sort_values(["平均許容幅%","寄付き即時約定率%"], ascending=[True,False]).iloc[0]["方式"]
-    else:
-        recommended = summary.sort_values("日中推定約定率%", ascending=False).iloc[0]["方式"]
-
-    gap_stats = {
-        "発動件数": int(len(bt)),
-        "必要幅中央値%": float(bt["required_buffer_pct"].median()),
-        "必要幅90%点%": float(bt["required_buffer_pct"].quantile(.90)),
-        "必要幅95%点%": float(bt["required_buffer_pct"].quantile(.95)),
-        "必要幅最大%": float(bt["required_buffer_pct"].max()),
-        "参考推奨方式": recommended,
-    }
-    return summary, gap_stats
 
 def mark(v):
     return "🟢" if bool(v) else "－"
@@ -1013,10 +836,8 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
         st.markdown(f"**注文種類：{ai['注文種類']}**")
         st.write(f"**買いの発動条件**：{ai['買い逆指値発動価格表示']}")
         st.write(f"**発動後の買い指値**：{ai['発動後買い指値表示']}")
-        st.caption(f"根拠：{ai['発動後買い指値の根拠']}")
         st.write(f"**損切りの発動条件**：{ai['損切り逆指値発動価格表示']}")
         st.write(f"**発動後の売り指値**：{ai['発動後売り指値表示']}")
-        st.caption(f"根拠：{ai['発動後売り指値の根拠']}")
         st.write(f"**注文価格の根拠**：{ai['注文価格の根拠']}")
         st.write(f"**損切り価格の根拠**：{ai['損切り価格の根拠']}")
         st.write(f"**利確価格の根拠**：{ai['利確価格の根拠']}")
@@ -1040,15 +861,6 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
 
     return {"metrics":r,"ai":ai,"holding":h,"earnings":earnings}
 
-
-
-
-# ------------------------------------------------------------
-# v19.4.2 表示列の安全化
-# ------------------------------------------------------------
-def safe_columns(df, columns):
-    """表示列が不足していてもKeyErrorでアプリ全体を停止させない。"""
-    return df.reindex(columns=columns)
 
 
 # ------------------------------------------------------------
@@ -1117,7 +929,7 @@ def practical_ranking_column_config():
         ),
         "発動後買い指値表示": st.column_config.TextColumn(
             "買い｜発動後の指値",
-            help="逆指値が発動したあと、実際に出す買い指値です。固定ティックではなく、ATRの15%を基本に、発動価格の0.30%を上限、最低2ティックで自動計算します。この価格を超えて飛んだ場合は約定しない可能性があります。"
+            help="逆指値が発動したあと、実際に出す買い指値です。発動価格より設定したティック数だけ上までを許容します。この価格を超えて飛んだ場合は約定しない可能性があります。"
         ),
         "損切り逆指値発動価格表示": st.column_config.TextColumn(
             "損切り｜発動条件",
@@ -1125,7 +937,7 @@ def practical_ranking_column_config():
         ),
         "発動後売り指値表示": st.column_config.TextColumn(
             "損切り｜発動後の売り指値",
-            help="損切り逆指値が発動したあと、実際に出す売り指値です。固定ティックではなく、ATRの15%を基本に、発動価格の0.30%を上限、最低2ティックで自動計算します。価格がこの指値より下へ飛んだ場合、約定しない可能性があります。"
+            help="損切り逆指値が発動したあと、実際に出す売り指値です。発動価格より設定したティック数だけ下までを許容します。価格がこの指値より下へ飛んだ場合、約定しない可能性があります。"
         ),
         "売買シナリオ": st.column_config.TextColumn(
             "売買シナリオ",
@@ -1184,10 +996,10 @@ def practical_ranking_explainer():
 - **ルール評価**：S/A/B/C等の独自段階評価。統計的な格付けではありません。
 - **注文種類**：楽天証券での参考注文。**買い逆指値＝上抜け確認、買い指値＝押し待ち**。
 - **買い｜発動条件**：買い逆指値で「何円以上になったら注文を発動するか」。
-- **買い｜発動後の指値**：発動後に実際に出す買い指値。許容幅は自動計算（ATRの15%を基本、発動価格の0.30%を上限、最低2ティック）。
+- **買い｜発動後の指値**：発動後に実際に出す買い指値。発動価格より設定ティック数だけ上までを許容。
 - **損切り｜発動条件**：保有後「何円以下になったら損切り注文を発動するか」。
-- **損切り｜発動後の売り指値**：発動後に実際に出す売り指値。許容幅は同じルールで自動計算。
-- **注文価格**：従来の要約表示。v19.4では上記4列を実注文向けの主表示にします。
+- **損切り｜発動後の売り指値**：発動後に実際に出す売り指値。発動価格より設定ティック数だけ下までを許容。
+- **注文価格**：従来の要約表示。v19.3では上記4列を実注文向けの主表示にします。
 - **注文価格の根拠**：ブレイク準備は「ブレイク水準＋1ティック」の買い逆指値。ブレイク直後は高値を追わず「現在値から0.75ATR程度の押し」を買い指値。75日線押し目は「前日高値＋指定ティック」を上抜けて反転確認する買い逆指値。
 - **損切り**：約定後の売り逆指値の参考値。
 - **損切り価格の根拠**：まず「買った理由が崩れる水準」を決めます。75日線押し目なら75日線の明確割れ、ブレイク系ならブレイク水準の支持失敗。ATRはブレイク系で日々のノイズを避ける補助バッファとしてのみ使用します。
@@ -1247,13 +1059,13 @@ def mode_cache_key(mode_name, selected_markets):
 
 def get_mode_cache(mode_name, selected_markets):
     key = mode_cache_key(mode_name, selected_markets)
-    return st.session_state.get("scan_cache_v195", {}).get(key)
+    return st.session_state.get("scan_cache_v193", {}).get(key)
 
 def set_mode_cache(mode_name, selected_markets, payload):
-    if "scan_cache_v195" not in st.session_state:
-        st.session_state.scan_cache_v195 = {}
+    if "scan_cache_v193" not in st.session_state:
+        st.session_state.scan_cache_v193 = {}
     key = mode_cache_key(mode_name, selected_markets)
-    st.session_state.scan_cache_v195[key] = payload
+    st.session_state.scan_cache_v193[key] = payload
 
 def cache_age_text(ts):
     if ts is None:
@@ -1614,7 +1426,7 @@ def ai_scores(r):
     stop_price_reason=""
     take_profit_reason=""
 
-    # v19.4 逆指値注文を「発動条件」と「発動後の実際の指値」に分解
+    # v19.3 逆指値注文を「発動条件」と「発動後の実際の指値」に分解
     buy_trigger_price=np.nan
     buy_limit_price=np.nan
     stop_trigger_price=np.nan
@@ -1623,10 +1435,6 @@ def ai_scores(r):
     buy_limit_text="—"
     stop_trigger_text="—"
     stop_limit_text="—"
-    buy_limit_buffer=np.nan
-    stop_limit_buffer=np.nan
-    buy_limit_reason="—"
-    stop_limit_reason="—"
 
     if chase:
         order_reason="過熱または買いやすさ不足。現在値を追いかけず、押し目形成後に再判定。"
@@ -1638,8 +1446,7 @@ def ai_scores(r):
         buy_order_type="買い逆指値"
         buy_price=float(trigger)
         buy_trigger_price=buy_price
-        buy_limit_buffer=adaptive_limit_buffer(buy_trigger_price, atr_yen)
-        buy_limit_price=buy_trigger_price + buy_limit_buffer
+        buy_limit_price=buy_trigger_price + tick_size(buy_trigger_price)*reverse_order_limit_ticks
         buy_trigger_text=f"{buy_trigger_price:.0f}円以上"
         buy_limit_text=f"{buy_limit_price:.0f}円"
         buy_price_text=f"発動 {buy_trigger_text} → 指値 {buy_limit_text}"
@@ -1647,7 +1454,7 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="まだブレイク前。上抜けを確認してから入る。"
-        buy_price_reason=f"直近高値（過去{breakout_days}営業日で超えられなかった高値）{float(r['Bブレイク水準']):.0f}円より、最小の値幅1つ分だけ上の {buy_price:.0f}円を条件価格にしています。つまり『{buy_price:.0f}円以上になったら買いを検討』です。安く買うための価格ではなく、直近高値を実際に突破して上昇の強さを確認するための価格です。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。発動後の指値は固定ティックではなく自動計算し、{buy_trigger_price:.0f}円＋許容幅{buy_limit_buffer:.0f}円＝{buy_limit_price:.0f}円です。許容幅は現行方式としてATRの15%を基本に、発動価格の0.30%を上限、最低2ティックとしています。これは最適値ではなく、v19.5の過去検証で比較対象にしています。"
+        buy_price_reason=f"直近高値（過去{breakout_days}営業日で超えられなかった高値）{float(r['Bブレイク水準']):.0f}円より、最小の値幅1つ分だけ上の {buy_price:.0f}円を条件価格にしています。つまり『{buy_price:.0f}円以上になったら買いを検討』です。安く買うための価格ではなく、直近高値を実際に突破して上昇の強さを確認するための価格です。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。v19.3では発動後の指値も別表示し、発動価格より{reverse_order_limit_ticks}ティック上までを買値の許容範囲にしています。"
         blevel=float(r["Bブレイク水準"])
         atr_abs=float(r["ATR14"]) if np.isfinite(r["ATR14"]) else np.nan
         buffer_abs=(blevel-stop_price)
@@ -1680,8 +1487,7 @@ def ai_scores(r):
         buy_order_type="買い逆指値"
         buy_price=float(r["A買い価格"])
         buy_trigger_price=buy_price
-        buy_limit_buffer=adaptive_limit_buffer(buy_trigger_price, atr_yen)
-        buy_limit_price=buy_trigger_price + buy_limit_buffer
+        buy_limit_price=buy_trigger_price + tick_size(buy_trigger_price)*reverse_order_limit_ticks
         buy_trigger_text=f"{buy_trigger_price:.0f}円以上"
         buy_limit_text=f"{buy_limit_price:.0f}円"
         buy_price_text=f"発動 {buy_trigger_text} → 指値 {buy_limit_text}"
@@ -1689,7 +1495,7 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(r["A初期損切り"])
         order_reason="75日線付近まで押しただけでは買わず、前日高値超えで反転を確認してから入る。"
-        buy_price_reason=f"75日移動平均線（過去75営業日の平均株価）付近まで下がった後、本当に上向きへ戻り始めたかを確認してから買う考え方です。前日の高値より最小の値幅分だけ上の {buy_price:.0f}円を超えたら買いを検討します。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。発動後の指値は{buy_trigger_price:.0f}円＋自動許容幅{buy_limit_buffer:.0f}円＝{buy_limit_price:.0f}円です。許容幅は現行方式としてATRの15%を基本に、発動価格の0.30%を上限、最低2ティックとしています。これは最適値ではなく、v19.5の過去検証で比較対象にしています。安い価格で待つ『買い指値』ではありません。"
+        buy_price_reason=f"75日移動平均線（過去75営業日の平均株価）付近まで下がった後、本当に上向きへ戻り始めたかを確認してから買う考え方です。前日の高値より最小の値幅分だけ上の {buy_price:.0f}円を超えたら買いを検討します。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。安い価格で待つ『買い指値』ではありません。"
         stop_price_reason=f"買った理由は『上向きの75日移動平均線（過去75営業日の平均株価）が下値を支える』と考えたためです。その75日線から設定した余裕幅だけ下の {stop_price:.0f}円を割ったら、買った前提が崩れたと判断する損切り参考です。このセットアップではATRを損切りの主な理由にはしていません。"
 
     elif setup.startswith("💹"):
@@ -1726,20 +1532,12 @@ def ai_scores(r):
     # 約定後の損切り逆指値も、発動価格と発動後の売り指値を分ける。
     if stop_order_type=="売り逆指値" and np.isfinite(stop_price):
         stop_trigger_price=float(stop_price)
-        stop_limit_buffer=adaptive_limit_buffer(stop_trigger_price, atr_yen)
-        stop_limit_price=stop_trigger_price - stop_limit_buffer
+        stop_limit_price=stop_trigger_price - tick_size(stop_trigger_price)*reverse_order_limit_ticks
         stop_trigger_text=f"{stop_trigger_price:.0f}円以下"
         stop_limit_text=f"{stop_limit_price:.0f}円"
     else:
         stop_trigger_text="—"
         stop_limit_text="—"
-
-    if np.isfinite(buy_trigger_price) and np.isfinite(buy_limit_price):
-        buy_limit_reason=f"発動価格 {buy_trigger_price:.0f}円 ＋ 自動許容幅 {buy_limit_buffer:.0f}円 ＝ {buy_limit_price:.0f}円。許容幅はATR（普段1日の値動き幅）の15%を基本に、発動価格の0.30%を上限、最低2ティックとして呼値単位に丸めます。"
-    elif buy_order_type=="買い指値" and np.isfinite(buy_limit_price):
-        buy_limit_reason="通常の買い指値なので、逆指値発動後の許容幅は使いません。"
-    if np.isfinite(stop_trigger_price) and np.isfinite(stop_limit_price):
-        stop_limit_reason=f"損切り発動価格 {stop_trigger_price:.0f}円 － 自動許容幅 {stop_limit_buffer:.0f}円 ＝ {stop_limit_price:.0f}円。許容幅はATR（普段1日の値動き幅）の15%を基本に、発動価格の0.30%を上限、最低2ティックとして呼値単位に丸めます。"
 
     # リスク計算は、逆指値買いでは発動後に許容する買い指値、
     # 損切り側では発動後の売り指値を使い、予定上の最悪寄りで計算。
@@ -1806,7 +1604,6 @@ def ai_scores(r):
         "買い逆指値発動価格表示":buy_trigger_text,
         "発動後買い指値":buy_limit_price,
         "発動後買い指値表示":buy_limit_text,
-        "発動後買い指値の根拠":buy_limit_reason,
         "注文条件":buy_condition,
         "損切り注文":stop_order_type,
         "損切り価格":stop_price,
@@ -1815,7 +1612,6 @@ def ai_scores(r):
         "損切り逆指値発動価格表示":stop_trigger_text,
         "発動後売り指値":stop_limit_price,
         "発動後売り指値表示":stop_limit_text,
-        "発動後売り指値の根拠":stop_limit_reason,
         "想定初期リスク%":risk_pct,
         "注文理由":order_reason,
         "売買シナリオ":(
@@ -1834,7 +1630,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.5")
+st.title("🎯 短期上昇株ハンター v19.3")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -1897,6 +1693,7 @@ with st.sidebar:
     long_max_low_dist = 10
     choruko_mcap = "5,000億円以上"
     choruko_material_default = "未確認"
+    reverse_order_limit_ticks = 3
 
     if mode.startswith("📘"):
         st.subheader("📘 本ベース設定")
@@ -1958,11 +1755,13 @@ with st.sidebar:
             "決算を詳しく確認する上位銘柄数",30,200,100,10,
             help="何を変える？：独自短期の上位候補のうち、決算情報を詳しく取得する銘柄数です。増やすほど決算面を広く確認できますが、Yahoo Financeへの個別取得が増えるためスキャン時間も長くなります。"
         )
-        st.caption("逆指値発動後の指値幅は自動計算（固定ティックは廃止）。ATR＝普段1日の値動き幅の15%を基本に、発動価格の0.30%を上限、最低2ティックとして呼値単位に丸めます。")
+        reverse_order_limit_ticks = st.slider(
+            "逆指値発動後の指値余裕（何ティック）", 1, 10, 3, 1,
+            help="何を変える？：買い/売りの逆指値が発動したあと、実際に出す指値を発動価格から何ティック離すかです。例：1ティック=1円の銘柄で3なら、買いは発動価格+3円、損切り売りは発動価格-3円。広げるほど約定しやすくなりますが、不利な価格まで許容します。"
+        )
 
         st.divider()
         st.subheader("過去類似シグナル検証")
-        st.caption("v19.5では通常の過去類似シグナル成績に加え、ブレイク時の『発動後指値の許容幅』も過去データで比較します。")
         bt_top_n = st.slider(
             "検証する上位銘柄数",5,30,10,5,
             help="何を変える？：独自短期ランキングの上位何銘柄まで過去類似シグナルを検証するかです。増やすほど検証対象は広がりますが、バックテスト処理も重くなります。"
@@ -2032,8 +1831,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
-if "scan_cache_v195" not in st.session_state:
-    st.session_state.scan_cache_v195 = {}
+if "scan_cache_v193" not in st.session_state:
+    st.session_state.scan_cache_v193 = {}
 if "holdings_v18" not in st.session_state:
     st.session_state.holdings_v18 = []
 if "last_individual_v18" not in st.session_state:
@@ -2204,7 +2003,7 @@ with btn1:
 with btn2:
     if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
         key = mode_cache_key(mode, selected_markets)
-        st.session_state.scan_cache_v195.pop(key, None)
+        st.session_state.scan_cache_v193.pop(key, None)
         cache_payload = None
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
@@ -2241,14 +2040,14 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
         st.subheader("📊 実戦ランキング")
         st.caption("前回スキャン結果を表示しています。モード切替では再取得しません。")
         st.dataframe(
-            safe_columns(tech.head(100), ["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]),
+            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]],
             use_container_width=True,hide_index=True,
             column_config=practical_ranking_column_config()
         )
         practical_ranking_explainer()
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                safe_columns(tech.head(100), ["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","発動後買い指値の根拠","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","発動後売り指値の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]),
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,hide_index=True
             )
         st.stop()
@@ -2632,16 +2431,16 @@ if st.session_state.run_scan_v10:
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
         st.dataframe(
-            safe_columns(tech.head(100), ["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]),
+            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]],
             use_container_width=True,
             hide_index=True,
             column_config=practical_ranking_column_config()
         )
         practical_ranking_explainer()
-        st.warning("逆指値は『発動条件』と『発動後の指値』を別々に表示しています。指値付き逆指値は価格が指値を飛び越えると約定しない場合があります。発動後指値の自動許容幅は経験則ベースです。v19.5では過去のブレイク発動日を使って、2ティック固定・0.10/0.20/0.30%・ATR方式を比較表示します。現行方式が最適とは限りません。呼値はアプリ内の簡易計算なので、最終入力時は楽天証券の注文画面でも確認してください。株価データはリアルタイム保証ではありません。")
+        st.warning("逆指値は『発動条件』と『発動後の指値』を別々に表示しています。指値付き逆指値は価格が指値を飛び越えると約定しない場合があります。呼値はアプリ内の簡易計算なので、最終入力時は楽天証券の注文画面でも確認してください。株価データはリアルタイム保証ではありません。")
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                safe_columns(tech.head(100), ["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","発動後買い指値の根拠","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","発動後売り指値の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]),
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -2669,60 +2468,6 @@ if st.session_state.run_scan_v10:
             st.caption("これは銘柄ごとの過去類似シグナル集計で、将来の勝率ではありません。サンプル件数が少ない結果は特に慎重に見てください。")
         else:
             st.info("現在の取得期間では十分な過去シグナルがありません。株価をさかのぼる期間を1年または2年にすると検証件数が増えます。")
-
-        st.subheader("🧪 v19.5｜逆指値の発動後指値バッファ検証")
-        st.caption("『0.15×ATR・上限0.30%・最低2ティック』が本当に妥当かを、ランキング上位銘柄の過去ブレイク局面で比較します。固定の正解値ではなく、約定しやすさと買値悪化のトレードオフを見る検証です。")
-        buffer_frames=[]
-        for _, rr in tech.head(min(bt_top_n,len(tech))).iterrows():
-            d_buf=data.get(rr["ticker"])
-            bres=backtest_breakout_limit_buffer(d_buf,slope_days=slope_days,breakout_days=breakout_days)
-            if bres is not None and not bres.empty:
-                bres=bres.copy()
-                bres["銘柄"]=rr["銘柄"]
-                buffer_frames.append(bres)
-
-        buffer_summary, gap_stats=summarize_buffer_backtests(buffer_frames)
-        if buffer_summary is not None and gap_stats is not None:
-            c1,c2,c3,c4=st.columns(4)
-            c1.metric("過去の発動件数",f"{gap_stats['発動件数']}件")
-            c2.metric("必要幅 90%点",f"{gap_stats['必要幅90%点%']:.3f}%")
-            c3.metric("必要幅 95%点",f"{gap_stats['必要幅95%点%']:.3f}%")
-            c4.metric("参考推奨",str(gap_stats["参考推奨方式"]))
-
-            display_buffer=buffer_summary.copy()
-            display_buffer["現行"] = display_buffer["方式"].eq("現行 0.15ATR・上限0.30%").map({True:"← 現在使用",False:""})
-            st.dataframe(
-                display_buffer[["方式","現行","発動件数","寄付き即時約定率%","日中推定約定率%","平均許容幅円","平均許容幅%","指値超え寄付き率%"]],
-                use_container_width=True,hide_index=True,
-                column_config={
-                    "寄付き即時約定率%":st.column_config.NumberColumn("寄付き即時約定率",format="%.1f%%"),
-                    "日中推定約定率%":st.column_config.NumberColumn("日中推定約定率",format="%.1f%%"),
-                    "平均許容幅円":st.column_config.NumberColumn("平均許容幅",format="%.1f円"),
-                    "平均許容幅%":st.column_config.NumberColumn("平均許容幅%",format="%.3f%%"),
-                    "指値超え寄付き率%":st.column_config.NumberColumn("指値を超えて寄付いた率",format="%.1f%%"),
-                }
-            )
-            with st.expander("❓ この検証の読み方"):
-                st.markdown(f"""
-- **寄付き即時約定率**：発動日に寄付きから逆指値が発動した場合、設定した買い指値以内で始まった割合。
-- **日中推定約定率**：寄付きで指値を飛び越えても、その日の安値が指値まで戻ったケースを含む推定値。
-- **平均許容幅**：発動価格からどこまで高い買値を許す設定か。広いほど約定しやすい一方、高値掴みの許容も大きくなります。
-- **指値を超えて寄付いた率**：発動日に株価が買い指値より高く始まった割合。
-- **必要幅90%点 / 95%点**：過去の発動日の寄付きギャップの90% / 95%が収まった幅です。
-
-**現在方式**：0.15×ATR（ATR＝普段1日の値動き幅）を基本に、発動価格の0.30%を上限、最低2ティック。  
-**今回の参考推奨**：**{gap_stats["参考推奨方式"]}**
-
-これは**日足OHLCからの推定**です。板情報や発動後の細かな約定順序は再現できないため、楽天証券での実際の約定率を保証するものではありません。
-""")
-            if gap_stats["発動件数"] < 20:
-                st.warning("検証サンプルが20件未満です。参考値として見てください。株価取得期間を2年にするとサンプルが増えやすくなります。")
-            elif str(gap_stats["参考推奨方式"]) != "現行 0.15ATR・上限0.30%":
-                st.warning("今回の過去データでは、現在の0.15ATR方式より小さい許容幅でも95%以上の推定約定率を満たす方式があります。現行設定が最適とは限りません。")
-            else:
-                st.info("今回の過去データでは、現行0.15ATR方式が『推定約定率95%以上の中で許容幅が小さい方式』として残りました。ただし将来の最適性を保証しません。")
-        else:
-            st.info("バッファ検証に必要な過去のブレイク発動件数を確保できませんでした。取得期間を1年または2年にしてください。")
 
         tabs=st.tabs(["🔥 ブレイク準備中","🎯 押し目","🚀 ブレイク直後","💹 決算加速","📊 6要素の内訳"])
 
