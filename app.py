@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v18.0.1",
+    page_title="短期上昇株ハンター v18.0.3",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -710,6 +710,12 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
 
     st.info(f"**保有者目線：{h['保有評価']}**  {h['保有コメント']}")
 
+    st.markdown("### 🧭 現在のセットアップ判定根拠")
+    st.success(f"**{ai['セットアップ']}**")
+    for reason in ai.get("セットアップ根拠一覧",[]):
+        st.write(f"・{reason}")
+    st.caption("この判定はルールベースです。『ブレイク準備中』は高値への接近・75日線の向き・出来高などの条件を満たした状態を表し、将来の上昇を保証するものではありません。")
+
     st.markdown("### 📌 新規買い評価と保有評価を分けて確認")
     summary=pd.DataFrame([{
         "現在のセットアップ":ai["セットアップ"],
@@ -731,6 +737,12 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
         "新規買い価格":ai["注文価格表示"],
     }])
     st.dataframe(manage,use_container_width=True,hide_index=True)
+
+    with st.expander("🧮 新規買いの注文価格・損切り・利確の根拠"):
+        st.markdown(f"**注文種類：{ai['注文種類']}**")
+        st.write(f"**注文価格の根拠**：{ai['注文価格の根拠']}")
+        st.write(f"**損切り価格の根拠**：{ai['損切り価格の根拠']}")
+        st.write(f"**利確価格の根拠**：{ai['利確価格の根拠']}")
     st.caption("売り逆指値・利確参考はルールベースの管理目安です。現在の保有状況や許容損失に応じて調整してください。")
 
     with st.expander("📊 テクニカル詳細"):
@@ -813,6 +825,21 @@ def practical_ranking_column_config():
             "注文価格",
             help="買い注文を出す場合の参考価格です。買い逆指値なら『○円以上になったら』の条件価格、買い指値なら『○円付近まで下がったら』の待ち価格です。"
         ),
+        "注文価格の根拠": st.column_config.TextColumn(
+            "注文価格の根拠",
+            help="なぜその注文価格になったかを、ブレイク水準・ATR・75日線などの具体的な数値とセットアップの考え方から説明します。",
+            width="large"
+        ),
+        "損切り価格の根拠": st.column_config.TextColumn(
+            "損切り価格の根拠",
+            help="なぜその損切り価格になったかを、ATR・75日線・ブレイク水準などから説明します。",
+            width="large"
+        ),
+        "利確価格の根拠": st.column_config.TextColumn(
+            "利確価格の根拠",
+            help="利確①・②の計算根拠です。原則として買値と損切りの差を1Rとし、2R・3Rを参考値として表示します。",
+            width="large"
+        ),
         "損切り価格表示": st.column_config.TextColumn(
             "損切り",
             help="買い約定後に設定する売り逆指値の参考価格です。ATRや75日線・ブレイク水準などから機械的に計算した目安で、絶対的な正解価格ではありません。"
@@ -842,11 +869,19 @@ def practical_ranking_explainer():
 - **前日比 / 前日比%**：1営業日前の終値から、今日どれだけ動いたか。
 - **短期スコア**：トレンド・出来高・モメンタム・業績・買い位置・過熱リスクなどを統合した独自スコア。**勝率ではありません**。
 - **セットアップ**：ブレイク準備、ブレイク直後、75日線押し目など、現在のチャートの型。
+- **セットアップ判定根拠**：詳細画面で、その銘柄がなぜその型になったかを具体的な数値で表示。
+  - **🔥 ブレイク準備中**：直近高値の3%以内（まだ未突破）＋75日線上向き＋出来高倍率1.1倍以上。
+  - **🚀 ブレイク直後**：直近高値を上抜け後3%以内＋75日線上向き＋出来高倍率1.3倍以上。
+  - **🎯 75日線押し目**：75日線上向き＋株価が75日線の-3%〜0%。
+  - **📈 モメンタム継続**：60日騰落率+15%以上など、中期上昇を維持しつつ短期過熱が極端でない状態。
 - **ルール評価**：S/A/B/C等の独自段階評価。統計的な格付けではありません。
 - **注文種類**：楽天証券での参考注文。**買い逆指値＝上抜け確認、買い指値＝押し待ち**。
 - **注文価格**：その注文を出す場合の条件価格または指値候補。
+- **注文価格の根拠**：ブレイク準備なら「ブレイク水準＋1ティック」、ブレイク直後なら「現在値から0.75ATR程度の押し」、75日線押し目なら「75日線近辺の押し目候補」など、セットアップ別に計算理由を表示。
 - **損切り**：約定後の売り逆指値の参考値。
+- **損切り価格の根拠**：ATR・75日線・ブレイク水準など、損切り参考値の算出基準を表示。
 - **利確①**：基本的に損切り幅の2倍（2R）を狙う第一利確参考値。
+- **利確価格の根拠**：買値と損切りの差を1Rとして、利確①=2R、利確②=3Rとするリスク管理上の考え方。
 - **RR**：利益幅 ÷ 損失幅。2.00ならリスク1に対して利益2を狙う設計。
 - **決算警告**：決算予定が近い場合の注意。空欄でも予定日を取得できていない場合があります。
 
@@ -1155,6 +1190,48 @@ def ai_scores(r):
     if not signals:
         signals=["監視"]
 
+    # v18.0.2 セットアップ判定根拠
+    setup_reasons=[]
+    if setup=="🔥 ブレイク準備中":
+        setup_reasons=[
+            f"直近高値まで {abs(ext):.2f}%" if np.isfinite(ext) else "直近高値へ接近",
+            f"75日線は上向き（比較期間前比 {slope:+.2f}%）",
+            f"出来高は20日平均の {vr:.2f}倍",
+            "高値をまだ明確に上抜けていないため『ブレイク直後』ではなく『準備中』",
+        ]
+    elif setup=="🚀 ブレイク直後":
+        setup_reasons=[
+            f"直近高値を {ext:+.2f}% 上抜け" if np.isfinite(ext) else "直近高値を上抜け",
+            f"75日線は上向き（比較期間前比 {slope:+.2f}%）",
+            f"出来高は20日平均の {vr:.2f}倍",
+            "高値突破後3%以内のため『ブレイク直後』",
+        ]
+    elif setup=="🎯 押し目・75日線接近":
+        setup_reasons=[
+            f"株価は75日線の {dev:+.2f}% 位置",
+            f"75日線は上向き（比較期間前比 {slope:+.2f}%）",
+            "75日線のすぐ下まで押しているため押し目候補",
+        ]
+    elif setup=="📈 モメンタム継続":
+        setup_reasons=[
+            f"60日騰落率 {r60:+.2f}%",
+            f"5日騰落率 {r5:+.2f}%",
+            f"75日線乖離 {dev:+.2f}%",
+            "中期上昇トレンドを維持しつつ、短期の過熱が極端ではない",
+        ]
+    elif setup=="💹 決算加速":
+        setup_reasons=[
+            "決算モメンタムCに該当",
+            f"20日騰落率 {r20:+.2f}%",
+            "決算面の加速を確認し、株価も20日ベースで上向き",
+        ]
+    else:
+        setup_reasons=[
+            "押し目・ブレイク・決算加速・モメンタム継続の主要条件が未達",
+            "現在は監視対象として扱う",
+        ]
+    setup_reason_text=" / ".join(setup_reasons)
+
     # Risk / overheat; higher score = safer
     risk=95
     if dev>10: risk-=15
@@ -1211,9 +1288,14 @@ def ai_scores(r):
     stop_order_type="—"
     stop_price=np.nan
     order_reason=""
+    buy_price_reason=""
+    stop_price_reason=""
+    take_profit_reason=""
 
     if chase:
         order_reason="過熱または買いやすさ不足。現在値を追いかけず、押し目形成後に再判定。"
+        buy_price_reason="注文を出さないため買い価格は設定しません。75日線乖離・ブレイク後上昇率・買いやすさのいずれかが過熱側です。"
+        stop_price_reason="未約定のため損切り価格は設定しません。"
 
     elif setup.startswith("🔥"):
         # ブレイク前：上抜けを確認してから買うため「買い逆指値」
@@ -1224,6 +1306,8 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="まだブレイク前。上抜けを確認してから入る。"
+        buy_price_reason=f"直近ブレイク水準 {float(r['Bブレイク水準']):.0f}円 に1ティックを加えた {buy_price:.0f}円を条件価格にしています。高値を実際に上抜けたことを確認してから入るため『買い逆指値』です。"
+        stop_price_reason=f"ブレイク候補の初期損切り参考 {stop_price:.0f}円。ATRとブレイク水準を基準に算出した参考値です。"
 
     elif setup.startswith("🚀"):
         # ブレイク済み：すでに上抜けているため、さらに上で買う逆指値は使わず押し待ちの指値。
@@ -1239,6 +1323,8 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="ブレイク済み。新規の買い逆指値ではなく、押しを待つ指値買い。"
+        buy_price_reason=f"すでにブレイク済みなので高値を追いません。現在値 {current:.0f}円 から0.75ATR下を目安にしつつ、ブレイク水準 {breakout:.0f}円 を割らない範囲として {buy_price_text} を押し目候補にしています。"
+        stop_price_reason=f"ブレイク後の失敗に備える初期損切り参考 {stop_price:.0f}円。ATRとブレイク水準を基準にした参考値です。"
 
     elif setup.startswith("🎯"):
         # 75日線押し目：下で待つので買い指値
@@ -1249,6 +1335,8 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(r["A初期損切り"])
         order_reason="75日線付近の押し目を待って買う。"
+        buy_price_reason=f"75日線押し目セットアップの買い候補 {buy_price:.0f}円を使用しています。75日線付近まで押した後の反転を狙うため『買い指値』です。"
+        stop_price_reason=f"75日線割れの初期損切り参考 {stop_price:.0f}円。75日線と設定済みバッファを基準に算出しています。"
 
     elif setup.startswith("💹"):
         # 決算加速だけでは注文方法を決め打ちしない。
@@ -1259,6 +1347,8 @@ def ai_scores(r):
         stop_order_type="—"
         stop_price=np.nan
         order_reason="決算の良さだけを理由に注文種類を決めない。"
+        buy_price_reason="決算加速だけではエントリー価格の根拠が不足するため、押し目またはブレイク条件が追加で出るまで価格を設定しません。"
+        stop_price_reason="未約定のため損切り価格は設定しません。"
 
     elif setup.startswith("📈"):
         # モメンタム継続は高値追いを避け、明確な新トリガーが出るまで待つ。
@@ -1269,11 +1359,15 @@ def ai_scores(r):
         stop_order_type="—"
         stop_price=np.nan
         order_reason="モメンタムだけで高値を追わない。"
+        buy_price_reason="モメンタム継続だけでは高値追いになる可能性があるため、押し目または新しいブレイク準備シグナルが出るまで価格を設定しません。"
+        stop_price_reason="未約定のため損切り価格は設定しません。"
 
     else:
         buy_order_type="注文しない"
         buy_condition="監視継続"
         order_reason="注文方法を一意に決められるセットアップではない。"
+        buy_price_reason="主要セットアップの条件が不足しているため、買い価格は設定しません。"
+        stop_price_reason="未約定のため損切り価格は設定しません。"
 
     risk_base = buy_price if np.isfinite(buy_price) else np.nan
     risk_pct=((stop_price/risk_base)-1)*100 if np.isfinite(risk_base) and np.isfinite(stop_price) and risk_base else np.nan
@@ -1288,6 +1382,11 @@ def ai_scores(r):
         reward_pct=(take_profit1/buy_price-1)*100
     take_profit1_text=f"{take_profit1:.0f}円" if np.isfinite(take_profit1) else "—"
     take_profit2_text=f"{take_profit2:.0f}円" if np.isfinite(take_profit2) else "—"
+    if np.isfinite(take_profit1) and np.isfinite(buy_price) and np.isfinite(stop_price):
+        risk_yen=buy_price-stop_price
+        take_profit_reason=f"買値 {buy_price:.0f}円 と損切り {stop_price:.0f}円 の差 {risk_yen:.0f}円を1Rとし、利確①は2R、利確②は3R上に置くリスク管理上の参考値です。価格到達を予測するものではありません。"
+    else:
+        take_profit_reason="買値または損切り価格が未設定のため、利確価格も設定していません。"
     if buy_order_type in ["買い逆指値","買い指値"]:
         practical_priority="🟢 注文候補" if ease>=70 else ("🟡 条件待ち" if ease>=55 else "🟠 押し待ち")
     else:
@@ -1313,6 +1412,8 @@ def ai_scores(r):
         "エントリー":entry,
         "リスク":risk,
         "セットアップ":setup,
+        "セットアップ判定根拠":setup_reason_text,
+        "セットアップ根拠一覧":setup_reasons,
         "追加シグナル":"・".join(signals),
         "ルール評価":grade,
         "評価コメント":comment,
@@ -1325,6 +1426,9 @@ def ai_scores(r):
         "損切り価格表示":stop_price_text,
         "想定初期リスク%":risk_pct,
         "注文理由":order_reason,
+        "注文価格の根拠":buy_price_reason,
+        "損切り価格の根拠":stop_price_reason,
+        "利確価格の根拠":take_profit_reason,
         "注文サマリー":order_summary,
         "利確目安①":take_profit1,"利確目安②":take_profit2,
         "利確目安①表示":take_profit1_text,"利確目安②表示":take_profit2_text,
@@ -1332,7 +1436,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v18.0.1")
+st.title("🎯 短期上昇株ハンター v18.0.3")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -1704,7 +1808,7 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
         practical_ranking_explainer()
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","注文条件","注文理由","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,hide_index=True
             )
         st.stop()
@@ -2038,7 +2142,7 @@ if st.session_state.run_scan_v10:
         st.warning("買い逆指値＝上抜け確認、買い指値＝押し待ち、売り逆指値＝約定後の損切り。株価データはリアルタイム保証ではありません。")
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","注文条件","注文理由","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
