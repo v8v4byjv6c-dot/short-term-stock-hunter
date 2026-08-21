@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v14",
+    page_title="短期上昇株ハンター v17",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -226,6 +226,10 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
         return None
 
     close=float(x.Close); high=float(x.High); ma25=float(x.MA25); ma75=float(x.MA75)
+    prev_close=float(p.Close)
+    day_change=close-prev_close
+    day_change_pct=(close/prev_close-1)*100 if prev_close else np.nan
+    open_today=float(x.Open); high_today=float(x.High); low_today=float(x.Low)
     slope=(ma75/float(x.OLD)-1)*100
     dev=float(x.DEV); r5=float(x.R5); r20=float(x.R20); r60=float(x.R60)
     vr=float(x.VR) if np.isfinite(x.VR) else 0
@@ -236,15 +240,18 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     # Aは参考書どおり「75日線より下」にある銘柄だけを候補にする。
     # そのうえで、75日線とのマイナス乖離が小さいほど高評価。
     below_75 = close < ma75
-    near = -max_dev <= dev < 0.0
-    crossed = np.isfinite(float(p.MA75)) and float(p.Close) <= float(p.MA75) and close > ma75
+    # v16 本ベースA：上向き75日線の「すぐ下」だけを対象にする。
+    near = -3.0 <= dev < 0.0
     bullish = close > float(p.Close) and close > float(x.Open)
 
     A = trend and below_75 and near
-    dist = max(0,100-abs(dev)/max(max_dev,.1)*100)
+    # 0%直下ほど高評価。-3%で70点、0%直下で100点。
+    dist = max(0, min(100, 100 + dev*10))
     sl = min(100,max(0,slope/5*100))
-    As = min(100,max(0,.50*dist+.35*sl+15*crossed+8*bullish))
-    a_buy = ma75 + tick_size(ma75)*buy_ticks
+    As = min(100,max(0,.65*dist+.35*sl)) if A else 0
+
+    # 75日線付近に来ただけでは買わず、前日高値超えで反転確認。
+    a_buy = float(p.High) + tick_size(float(p.High))*buy_ticks
     a_stop = ma75*(1-a_stop_buffer_pct/100)
 
     B = bool(trend and np.isfinite(bh) and close > bh and vr >= 1.3)
@@ -292,7 +299,8 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     b_stop = (bh - atr14) if np.isfinite(bh) and np.isfinite(atr14) else np.nan
 
     return {
-        "株価":close, "75日線":ma75,
+        "株価":close, "前日終値":prev_close, "前日比":day_change, "前日比%":day_change_pct,
+        "始値":open_today, "高値":high_today, "安値":low_today, "75日線":ma75,
         "75日線_比較期間前比%":slope, "75日線_乖離率%":dev,
         "出来高_20日平均比":vr, "20日騰落率%":r20, "60日騰落率%":r60,
         "5日騰落率%":r5,
@@ -345,6 +353,224 @@ def financial_momentum(ticker):
         return {"C":C,"Cスコア":Cs,"営業利益_前年同期比%":og,"売上高_前年同期比%":rg}
     except Exception:
         return {}
+
+
+# ------------------------------------------------------------
+# 長期・年初来安値モード
+# ------------------------------------------------------------
+def long_price_metrics(d):
+    """現在年の年初来安値と、その安値からの距離を計算。"""
+    try:
+        if d is None or d.empty:
+            return None
+        x = d.copy()
+        if isinstance(x.columns, pd.MultiIndex):
+            x.columns = x.columns.get_level_values(0)
+        if not all(c in x.columns for c in ["Close","Low","High"]):
+            return None
+        x = x.dropna(subset=["Close","Low"])
+        if x.empty:
+            return None
+
+        idx = pd.DatetimeIndex(x.index)
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        x.index = idx
+
+        current_year = pd.Timestamp.now().year
+        ytd = x[x.index >= pd.Timestamp(f"{current_year}-01-01")]
+        if ytd.empty:
+            return None
+
+        current = float(ytd["Close"].iloc[-1])
+        prev = float(ytd["Close"].iloc[-2]) if len(ytd) >= 2 else np.nan
+        ytd_low = float(ytd["Low"].min())
+        ytd_high = float(ytd["High"].max())
+        low_date = ytd["Low"].idxmin().strftime("%Y-%m-%d")
+        low_distance = (current / ytd_low - 1) * 100 if ytd_low > 0 else np.nan
+        high_drawdown = (current / ytd_high - 1) * 100 if ytd_high > 0 else np.nan
+
+        # 年初来安値に近いほど100点。20%以上離れたら0点。
+        low_score = np.clip(100 - max(0, low_distance) * 5, 0, 100)
+
+        return {
+            "株価": current,
+            "前日終値": prev,
+            "前日比": current - prev if np.isfinite(prev) else np.nan,
+            "前日比%": (current / prev - 1) * 100 if np.isfinite(prev) and prev else np.nan,
+            "年初来安値": ytd_low,
+            "年初来安値日": low_date,
+            "年初来安値から%": low_distance,
+            "年初来高値": ytd_high,
+            "年初来高値から%": high_drawdown,
+            "安値接近度": float(low_score),
+        }
+    except Exception:
+        return None
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def long_term_fundamentals(ticker):
+    """
+    yfinanceで取得できる範囲のファンダメンタル。
+    取得不能項目は欠損のままにし、推測しない。
+    """
+    try:
+        info = yf.Ticker(ticker).info or {}
+        def num(key):
+            v = info.get(key, np.nan)
+            try:
+                return float(v) if v is not None else np.nan
+            except Exception:
+                return np.nan
+
+        market_cap = num("marketCap")
+        roe = num("returnOnEquity")
+        op_margin = num("operatingMargins")
+        profit_margin = num("profitMargins")
+        revenue_growth = num("revenueGrowth")
+        earnings_growth = num("earningsGrowth")
+        dividend_yield = num("dividendYield")
+        forward_pe = num("forwardPE")
+        trailing_pe = num("trailingPE")
+        pbr = num("priceToBook")
+        debt_equity = num("debtToEquity")
+        payout = num("payoutRatio")
+
+        # yfinanceの dividendYield は環境によって 0.03 / 3.0 の両方があり得るため正規化。
+        if np.isfinite(dividend_yield) and dividend_yield <= 1:
+            dividend_yield *= 100
+        if np.isfinite(roe) and abs(roe) <= 1:
+            roe *= 100
+        if np.isfinite(op_margin) and abs(op_margin) <= 1:
+            op_margin *= 100
+        if np.isfinite(profit_margin) and abs(profit_margin) <= 1:
+            profit_margin *= 100
+        if np.isfinite(revenue_growth) and abs(revenue_growth) <= 1:
+            revenue_growth *= 100
+        if np.isfinite(earnings_growth) and abs(earnings_growth) <= 1:
+            earnings_growth *= 100
+        if np.isfinite(payout) and abs(payout) <= 1:
+            payout *= 100
+
+        return {
+            "時価総額": market_cap,
+            "時価総額_億円": market_cap / 1e8 if np.isfinite(market_cap) else np.nan,
+            "ROE%": roe,
+            "営業利益率%": op_margin,
+            "純利益率%": profit_margin,
+            "売上成長率%": revenue_growth,
+            "利益成長率%": earnings_growth,
+            "配当利回り%": dividend_yield,
+            "予想PER": forward_pe,
+            "実績PER": trailing_pe,
+            "PBR": pbr,
+            "負債資本倍率": debt_equity,
+            "配当性向%": payout,
+        }
+    except Exception:
+        return {}
+
+def long_quality_scores(r):
+    """長期用。安値だけでなく企業の質・財務・配当/割安度を分けて採点。"""
+    def finite(name):
+        v = r.get(name, np.nan)
+        return float(v) if np.isfinite(v) else np.nan
+
+    mcap = finite("時価総額_億円")
+    roe = finite("ROE%")
+    opm = finite("営業利益率%")
+    rg = finite("売上成長率%")
+    eg = finite("利益成長率%")
+    dy = finite("配当利回り%")
+    pe = finite("予想PER")
+    pbr = finite("PBR")
+    de = finite("負債資本倍率")
+    proximity = finite("安値接近度")
+
+    # 企業クオリティ
+    q_parts = []
+    if np.isfinite(mcap):
+        q_parts.append(np.clip(35 + np.log10(max(mcap, 10)) * 14, 35, 95))
+    if np.isfinite(roe):
+        q_parts.append(np.clip(35 + roe * 3, 0, 100))
+    if np.isfinite(opm):
+        q_parts.append(np.clip(40 + opm * 3, 0, 100))
+    if np.isfinite(rg):
+        q_parts.append(np.clip(50 + rg * 2, 0, 100))
+    if np.isfinite(eg):
+        q_parts.append(np.clip(50 + eg * 1.3, 0, 100))
+    if np.isfinite(de):
+        # YahooのdebtToEquityは%ベースの場合が多い。低いほど加点。
+        q_parts.append(np.clip(95 - max(0, de - 30) * 0.35, 20, 95))
+    quality = float(np.mean(q_parts)) if q_parts else 45.0
+
+    # 配当・バリュエーション。安いだけを過度に加点しない。
+    v_parts = []
+    if np.isfinite(dy):
+        v_parts.append(np.clip(35 + dy * 12, 20, 100))
+    if np.isfinite(pe) and pe > 0:
+        v_parts.append(np.clip(105 - pe * 3, 20, 95))
+    if np.isfinite(pbr) and pbr > 0:
+        v_parts.append(np.clip(95 - max(0, pbr - 0.8) * 22, 20, 95))
+    value = float(np.mean(v_parts)) if v_parts else 50.0
+
+    proximity = proximity if np.isfinite(proximity) else 0
+    long_score = 0.40 * proximity + 0.45 * quality + 0.15 * value
+
+    low_dist = finite("年初来安値から%")
+    earnings_bad = np.isfinite(eg) and eg < -30
+    revenue_bad = np.isfinite(rg) and rg < -15
+    quality_bad = quality < 42
+
+    if np.isfinite(low_dist) and low_dist <= 5 and quality >= 68 and not earnings_bad:
+        judgment = "🟢 長期候補"
+    elif np.isfinite(low_dist) and low_dist <= 10 and quality >= 58 and not earnings_bad:
+        judgment = "🟡 分割買い候補"
+    elif np.isfinite(low_dist) and low_dist <= 5 and (quality_bad or earnings_bad or revenue_bad):
+        judgment = "🔴 安い理由を要確認"
+    elif quality >= 65:
+        judgment = "🟠 良企業・価格待ち"
+    else:
+        judgment = "⚪ 監視"
+
+    return pd.Series({
+        "企業クオリティ": quality,
+        "配当・割安度": value,
+        "長期総合スコア": float(long_score),
+        "長期判定": judgment,
+    })
+
+def long_buy_plan(r):
+    """長期向けの分割購入参考プラン。短期の逆指値とは別思想。"""
+    current = float(r["株価"])
+    low = float(r["年初来安値"])
+    dist = float(r["年初来安値から%"])
+    judgment = str(r["長期判定"])
+
+    if judgment.startswith("🔴") or judgment.startswith("⚪"):
+        return pd.Series({
+            "長期買い方": "今は買わず要因確認",
+            "1回目": "—", "2回目": "—", "3回目": "—",
+            "長期前提崩れ": "大幅下方修正・赤字定着・減配・財務急悪化などを再確認",
+        })
+
+    if dist <= 3:
+        first = f"{current:.0f}円前後で30%"
+    else:
+        first_price = low * 1.03
+        first = f"{first_price:.0f}円以下まで待って30%"
+
+    second = f"{low:.0f}円前後で30%"
+    third = f"{low*0.95:.0f}円前後で40%"
+
+    return pd.Series({
+        "長期買い方": "一括ではなく3回分割",
+        "1回目": first,
+        "2回目": second,
+        "3回目": third,
+        "長期前提崩れ": "大幅下方修正・赤字定着・減配・財務急悪化など",
+    })
+
 
 # ------------------------------------------------------------
 # UI
@@ -496,17 +722,17 @@ def backtest_current_ai_logic(d, slope_days=20, breakout_days=60, horizon=5, tar
         "平均最大下落%":float(bt.max_down.mean()),
     }
 
-st.title("🎯 短期上昇株ハンター v14")
+st.title("🎯 短期上昇株ハンター v17")
 st.write("同じURLの中で、**📘 本ベース A/B/C/D** と **🧪 独自短期・独自統合スクリーナー**を切り替えられます。")
 
 mode = st.radio(
     "分析モード",
-    ["📘 本ベース A/B/C/D", "🧪 独自短期・独自統合スクリーナー"],
+    ["📘 本ベース A/B/C/D", "🧪 独自短期・独自統合スクリーナー", "🏦 長期・年初来安値"],
     horizontal=True,
-    help="独自短期スクリーニングも外部AI APIは使いません。トレンド・出来高・モメンタム・業績・買い位置・リスクを統合する独自ルールです。"
+    help="短期2モードと、年初来安値付近の優良株を探す長期モードを同じURLで切り替えます。"
 )
 
-with st.expander("ℹ️ 2つのモードの違い"):
+with st.expander("ℹ️ 3つのモードの違い"):
     st.markdown("""
 **📘 本ベース A/B/C/D**  
 これまで育ててきたロジックです。Aは参考書の「75日線が上向き・株価は75日線より下・75日線上抜けで買う」を中心にしています。B/C/Dは補助戦略です。
@@ -523,6 +749,11 @@ with st.expander("ℹ️ 2つのモードの違い"):
 
 さらに **「上昇力」** と **「今の買いやすさ」** を別々に表示します。  
 外部AI APIは使用しないため追加料金はかかりません。
+
+**🏦 長期・年初来安値**  
+年初来安値に近い銘柄を探しつつ、**安いだけでは買わない**長期モードです。  
+時価総額・ROE・利益率・成長率・配当・PER/PBRなど、取得できるファンダメンタルを合わせて「長期候補 / 分割買い候補 / 安い理由を要確認」を判定します。  
+短期売買とは混ぜず、長期の分割購入を前提に表示します。
 """)
 
 with st.sidebar:
@@ -544,6 +775,26 @@ with st.sidebar:
     bt_horizon = st.selectbox("何営業日先まで検証するか",[5,10,20],index=0)
     bt_target = st.selectbox("上昇目標",[3.0,5.0,8.0,10.0],index=1,format_func=lambda x:f"+{x:.0f}%")
     bt_stop = st.selectbox("下落警戒ライン",[2.0,3.0,5.0],index=1,format_func=lambda x:f"-{x:.0f}%")
+
+    if mode.startswith("🏦"):
+        st.divider()
+        st.subheader("長期・年初来安値設定")
+        long_fund_n = st.slider(
+            "ファンダメンタルを確認する上位銘柄数",
+            20, 150, 80, 10,
+            help="年初来安値に近い順に候補を絞り、上位だけ時価総額・ROE・配当等を取得します。増やすほど時間がかかります。"
+        )
+        long_mcap_filter = st.selectbox(
+            "大手企業フィルター",
+            ["制限なし","1,000億円以上","5,000億円以上","1兆円以上"],
+            index=2,
+            help="長期モードの『大手』タブや総合候補に使います。"
+        )
+        long_max_low_dist = st.slider(
+            "年初来安値から何%以内を重点表示するか",
+            1, 30, 10, 1,
+            help="10%なら、現在値が年初来安値から+10%以内の銘柄を重点候補にします。"
+        )
 
 try:
     all_u = get_jpx_universe()
@@ -584,10 +835,13 @@ market_label = "＋".join(selected_markets) if selected_markets else "未選択"
 m1,m2,m3 = st.columns(3)
 m1.metric("選択中", market_label)
 m2.metric("対象", f"{len(universe):,}銘柄")
-m3.metric("モード", "本ベース" if mode.startswith("📘") else "独自短期")
+m3.metric("モード", "本ベース" if mode.startswith("📘") else ("長期・年初来安値" if mode.startswith("🏦") else "独自短期"))
 
 regime = get_market_regime()
-st.info(f"**市場地合い：{regime['label']}（{regime['score']:.0f}/100）**  {regime['comment']}")
+if mode.startswith("🏦"):
+    st.info(f"**短期地合い（長期では参考）：{regime['label']}**  長期モードでは地合い点より、企業の質と年初来安値への接近を重視します。")
+else:
+    st.info(f"**市場地合い：{regime['label']}（{regime['score']:.0f}/100）**  {regime['comment']}")
 with st.expander("地合い判定の内訳"):
     if regime["details"]:
         st.dataframe(pd.DataFrame(regime["details"]), use_container_width=True, hide_index=True)
@@ -796,6 +1050,19 @@ def ai_scores(r):
     risk_pct=((stop_price/risk_base)-1)*100 if np.isfinite(risk_base) and np.isfinite(stop_price) and risk_base else np.nan
     stop_price_text=f"{stop_price:.0f}円以下" if np.isfinite(stop_price) else "—"
     order_summary=f"{buy_order_type}｜{buy_price_text}｜約定後 {stop_order_type} {stop_price_text}"
+    take_profit1=take_profit2=rr=reward_pct=np.nan
+    if np.isfinite(buy_price) and np.isfinite(stop_price) and buy_price > stop_price:
+        risk_yen=buy_price-stop_price
+        take_profit1=buy_price+2*risk_yen
+        take_profit2=buy_price+3*risk_yen
+        rr=2.0
+        reward_pct=(take_profit1/buy_price-1)*100
+    take_profit1_text=f"{take_profit1:.0f}円" if np.isfinite(take_profit1) else "—"
+    take_profit2_text=f"{take_profit2:.0f}円" if np.isfinite(take_profit2) else "—"
+    if buy_order_type in ["買い逆指値","買い指値"]:
+        practical_priority="🟢 注文候補" if ease>=70 else ("🟡 条件待ち" if ease>=55 else "🟠 押し待ち")
+    else:
+        practical_priority="🔴 見送り/監視"
 
     reasons=[]
     if trend>=75: reasons.append("上昇トレンドが強い")
@@ -830,6 +1097,9 @@ def ai_scores(r):
         "想定初期リスク%":risk_pct,
         "注文理由":order_reason,
         "注文サマリー":order_summary,
+        "利確目安①":take_profit1,"利確目安②":take_profit2,
+        "利確目安①表示":take_profit1_text,"利確目安②表示":take_profit2_text,
+        "想定利益%":reward_pct,"RR":rr,"実戦優先度":practical_priority,
     })
 
 if st.session_state.run_scan_v10:
@@ -854,6 +1124,9 @@ if st.session_state.run_scan_v10:
                     "銘柄":row["銘柄"],"市場":row["市場"],"業種":row["業種"],
                     "Yahoo!チャート":row["Yahoo!チャート"]
                 })
+                lm = long_price_metrics(d)
+                if lm:
+                    r.update(lm)
                 rows.append(r)
         if i%20==0:
             progress.progress(min(.68,(i+1)/max(total,1)*.68))
@@ -864,13 +1137,145 @@ if st.session_state.run_scan_v10:
 
     tech=pd.DataFrame(rows)
 
-    # Decide which names get detailed financial lookup.
+    # モード別の事前順位。
     if mode.startswith("📘"):
         tech["事前スコア"]=tech["Aスコア"]*.375+tech["Bスコア"]*.3125+tech["Dスコア"]*.3125
+    elif mode.startswith("🏦"):
+        # 長期ではまず年初来安値への接近を優先。
+        tech["事前スコア"]=tech["安値接近度"].fillna(0)
     else:
         tech["事前スコア"]=tech.apply(ai_pre_score,axis=1)
 
     tech=tech.sort_values("事前スコア",ascending=False).reset_index(drop=True)
+
+    # 長期モードは短期C判定をせず、上位候補のファンダメンタルを取得してここで完結。
+    if mode.startswith("🏦"):
+        status.info("② 年初来安値に近い候補の企業情報を確認しています…")
+        fund_n=min(long_fund_n, len(tech))
+        f_map={}
+        for j,t in enumerate(tech.head(fund_n).ticker):
+            f_map[t]=long_term_fundamentals(t)
+            progress.progress(.68+(j+1)/max(fund_n,1)*.32)
+        progress.empty()
+
+        fund_rows=[]
+        for _,rr in tech.head(fund_n).iterrows():
+            x=rr.to_dict()
+            x.update(f_map.get(rr["ticker"],{}))
+            fund_rows.append(x)
+        long_df=pd.DataFrame(fund_rows)
+
+        scores=long_df.apply(long_quality_scores,axis=1)
+        long_df=pd.concat([long_df,scores],axis=1)
+        plans=long_df.apply(long_buy_plan,axis=1)
+        long_df=pd.concat([long_df,plans],axis=1)
+
+        # 大手基準
+        mcap_threshold={
+            "制限なし":0,
+            "1,000億円以上":1000,
+            "5,000億円以上":5000,
+            "1兆円以上":10000,
+        }[long_mcap_filter]
+        long_df["大手条件"] = long_df["時価総額_億円"].fillna(-1) >= mcap_threshold if mcap_threshold>0 else True
+        long_df["重点安値圏"] = long_df["年初来安値から%"] <= long_max_low_dist
+
+        long_df=long_df.sort_values(
+            ["長期総合スコア","安値接近度","企業クオリティ"],
+            ascending=False
+        ).reset_index(drop=True)
+        long_df.insert(0,"順位",np.arange(1,len(long_df)+1))
+        status.success("長期・年初来安値ランキングを作成しました。")
+
+        st.subheader("🏦 長期・年初来安値｜総合候補")
+        st.caption("『安い＝買い』ではありません。年初来安値への近さと、取得できた企業クオリティ・配当/バリュエーションを分けて評価します。ファンダメンタルは年初来安値接近上位だけ取得するため、全上場銘柄を完全比較するものではありません。")
+
+        focus=long_df[long_df["重点安値圏"]].copy()
+        if mcap_threshold>0:
+            focus=focus[focus["大手条件"]]
+
+        if focus.empty:
+            st.info("現在の設定では総合候補がありません。年初来安値からの距離または大手フィルターを緩めてください。")
+        else:
+            st.dataframe(
+                focus[[
+                    "順位","長期判定","銘柄","Yahoo!チャート","株価","前日比%",
+                    "年初来安値","年初来安値日","年初来安値から%",
+                    "安値接近度","企業クオリティ","配当・割安度","長期総合スコア",
+                    "時価総額_億円","配当利回り%","ROE%","予想PER","PBR",
+                    "長期買い方","1回目","2回目","3回目"
+                ]],
+                use_container_width=True,hide_index=True,
+                column_config={
+                    "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
+                    "株価":st.column_config.NumberColumn("現在値",format="%.0f円"),
+                    "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
+                    "年初来安値":st.column_config.NumberColumn("年初来安値",format="%.0f円"),
+                    "年初来安値から%":st.column_config.NumberColumn("安値から",format="%+.2f%%"),
+                    "安値接近度":st.column_config.ProgressColumn("安値接近度",min_value=0,max_value=100,format="%.1f"),
+                    "企業クオリティ":st.column_config.ProgressColumn("企業クオリティ",min_value=0,max_value=100,format="%.1f"),
+                    "配当・割安度":st.column_config.ProgressColumn("配当・割安度",min_value=0,max_value=100,format="%.1f"),
+                    "長期総合スコア":st.column_config.ProgressColumn("長期総合",min_value=0,max_value=100,format="%.1f"),
+                    "時価総額_億円":st.column_config.NumberColumn("時価総額",format="%.0f億円"),
+                    "配当利回り%":st.column_config.NumberColumn("配当利回り",format="%.2f%%"),
+                    "ROE%":st.column_config.NumberColumn("ROE",format="%.1f%%"),
+                    "予想PER":st.column_config.NumberColumn("予想PER",format="%.1f倍"),
+                    "PBR":st.column_config.NumberColumn("PBR",format="%.2f倍"),
+                }
+            )
+
+        tabs=st.tabs(["📉 年初来安値接近","🏢 大手だけ","💰 高配当","⭐ 総合長期候補","🔎 詳細"])
+        with tabs[0]:
+            x=long_df.sort_values("年初来安値から%",ascending=True)
+            st.dataframe(
+                x[["順位","銘柄","Yahoo!チャート","株価","年初来安値","年初来安値から%","長期判定","企業クオリティ","時価総額_億円"]],
+                use_container_width=True,hide_index=True,
+                column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗")}
+            )
+        with tabs[1]:
+            x=long_df[long_df["大手条件"]].sort_values(["年初来安値から%","企業クオリティ"],ascending=[True,False])
+            if x.empty:
+                st.info("大手条件に該当する取得済み候補がありません。")
+            else:
+                st.dataframe(x[["順位","銘柄","Yahoo!チャート","株価","年初来安値から%","時価総額_億円","企業クオリティ","長期判定"]],use_container_width=True,hide_index=True,
+                    column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗")})
+        with tabs[2]:
+            x=long_df[long_df["配当利回り%"].fillna(0)>=3.0].sort_values(["配当利回り%","企業クオリティ"],ascending=False)
+            if x.empty:
+                st.info("配当利回り3%以上の取得済み候補はありません。")
+            else:
+                st.dataframe(x[["順位","銘柄","Yahoo!チャート","株価","年初来安値から%","配当利回り%","ROE%","長期判定"]],use_container_width=True,hide_index=True,
+                    column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗")})
+        with tabs[3]:
+            x=long_df[long_df["長期判定"].isin(["🟢 長期候補","🟡 分割買い候補"])].sort_values("長期総合スコア",ascending=False)
+            if x.empty:
+                st.info("現在の取得済み候補に長期候補はありません。")
+            else:
+                st.dataframe(x[["順位","長期判定","銘柄","Yahoo!チャート","株価","年初来安値から%","企業クオリティ","配当・割安度","長期総合スコア","1回目","2回目","3回目"]],use_container_width=True,hide_index=True,
+                    column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗")})
+        with tabs[4]:
+            st.dataframe(
+                long_df[[
+                    "順位","銘柄","年初来安値","年初来安値から%","年初来高値","年初来高値から%",
+                    "時価総額_億円","ROE%","営業利益率%","売上成長率%","利益成長率%",
+                    "配当利回り%","予想PER","実績PER","PBR","負債資本倍率","配当性向%",
+                    "長期判定","長期前提崩れ"
+                ]],
+                use_container_width=True,hide_index=True
+            )
+
+        csv=long_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 長期・年初来安値ランキングをCSV保存",
+            csv,
+            f"長期_年初来安値_{market_label}.csv",
+            "text/csv",
+            use_container_width=True
+        )
+
+        st.warning("長期モードは『年初来安値だから買う』機能ではありません。業績悪化・減配・構造的な競争力低下などで安値になっている可能性があります。分割購入案は参考値で、損失を限定するものではありません。")
+        st.stop()
+
     status.info("② 上位候補の決算データを確認しています…")
     n=min(c_check_count,len(tech)); cmap={}
     for j,t in enumerate(tech.head(n).ticker):
@@ -937,12 +1342,15 @@ if st.session_state.run_scan_v10:
         ranked=tech[tech["該当戦略数"]>=1]
 
         st.subheader("📘 本ベース｜総合ランキング")
+        st.caption("Aは『75日線が上向き』『株価が75日線の下』『乖離率 -3%〜0%』に限定。0%に近いほど高評価です。Aの買い目安は前日高値＋指定ティック超えによる反転確認価格です。")
         st.dataframe(
-            ranked[["順位","銘柄","Yahoo!チャート","株価","75日線","75日線_乖離率%","A","B","C","D","該当戦略数","買い価格目安","A初期損切り目安","B初期損切り目安","総合スコア","総合診断"]],
+            ranked[["順位","銘柄","Yahoo!チャート","株価","前日比","前日比%","75日線","75日線_乖離率%","A","B","C","D","該当戦略数","買い価格目安","A初期損切り目安","B初期損切り目安","総合スコア","総合診断"]],
             use_container_width=True,hide_index=True,
             column_config={
                 "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
                 "株価":st.column_config.NumberColumn("株価",format="%.0f円"),
+                "前日比":st.column_config.NumberColumn("前日比",format="%+.0f円"),
+                "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
                 "75日線":st.column_config.NumberColumn("75日線",format="%.0f円"),
                 "75日線_乖離率%":st.column_config.NumberColumn("75日線乖離",format="%+.2f%%"),
                 "買い価格目安":st.column_config.NumberColumn("買い目安",format="%.0f円"),
@@ -951,7 +1359,7 @@ if st.session_state.run_scan_v10:
                 "総合スコア":st.column_config.NumberColumn("総合",format="%.1f"),
             }
         )
-        st.caption("A/B/C/Dの考え方はv9を維持しています。Aは75日線より下の銘柄だけが候補です。")
+        st.caption("Aは上向き75日線の直下（乖離 -3%〜0%）だけを候補にし、75日線に近いほど高評価。実際の買いは前日高値＋指定ティック超えの反転確認を待つ設計です。")
 
     else:
         status.success("短期スクリーニングランキングを作成しました。")
@@ -974,34 +1382,15 @@ if st.session_state.run_scan_v10:
         elif regime["score"] < 60:
             tech["評価コメント"] = tech["評価コメント"].astype(str) + "／地合い中立"
 
-        st.subheader("🧪 独自短期スクリーニング｜総合ランキング＋楽天証券注文ナビ")
-        st.caption("スコアは独自ルールの100点評価で、上昇確率ではありません。注文欄はセットアップごとに『買い指値／買い逆指値／注文しない』を明示します。")
-        st.dataframe(
-            tech.head(100)[[
-                "順位","銘柄","Yahoo!チャート","株価","短期総合スコア","上昇力","今の買いやすさ",
-                "セットアップ","追加シグナル","ルール評価",
-                "注文種類","注文価格表示","注文条件","損切り注文","損切り価格表示",
-                "想定初期リスク%","次回決算日","決算警告","評価コメント"
-            ]],
-            use_container_width=True,hide_index=True,
-            column_config={
-                "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
-                "株価":st.column_config.NumberColumn("株価",format="%.0f円"),
-                "短期総合スコア":st.column_config.ProgressColumn("短期総合スコア",min_value=0,max_value=100,format="%.1f"),
-                "上昇力":st.column_config.ProgressColumn("上昇力",min_value=0,max_value=100,format="%.1f"),
-                "今の買いやすさ":st.column_config.ProgressColumn("買いやすさ",min_value=0,max_value=100,format="%.1f"),
-                "注文種類":st.column_config.TextColumn("楽天｜買い注文",width="medium"),
-                "注文価格表示":st.column_config.TextColumn("楽天｜買い価格",width="medium"),
-                "注文条件":st.column_config.TextColumn("注文条件",width="large"),
-                "損切り注文":st.column_config.TextColumn("約定後｜損切り",width="medium"),
-                "損切り価格表示":st.column_config.TextColumn("損切り価格",width="medium"),
-                "想定初期リスク%":st.column_config.NumberColumn("初期リスク",format="%.1f%%"),
-                "評価コメント":st.column_config.TextColumn("評価コメント",width="large"),
-            }
-        )
-        st.warning("注文ナビは参考値です。買い逆指値＝上抜け確認、買い指値＝押し待ち、売り逆指値＝約定後の損切りとして区別しています。指値・逆指値とも約定を保証しません。")
+        st.subheader("📊 実戦ランキング")
+        st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
+        st.dataframe(tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],use_container_width=True,hide_index=True,
+            column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),"株価":st.column_config.NumberColumn("現在値",format="%.0f円"),"前日比":st.column_config.NumberColumn("前日比",format="%+.0f円"),"前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),"短期総合スコア":st.column_config.ProgressColumn("短期スコア",min_value=0,max_value=100,format="%.1f"),"RR":st.column_config.NumberColumn("RR",format="%.2f")})
+        st.warning("買い逆指値＝上抜け確認、買い指値＝押し待ち、売り逆指値＝約定後の損切り。株価データはリアルタイム保証ではありません。")
+        with st.expander("🔎 詳細を見る"):
+            st.dataframe(tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高倍率","75日線","75日線傾き%","75日線乖離%","追加シグナル","注文条件","注文理由","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],use_container_width=True,hide_index=True)
 
-        st.subheader("🧪 v14｜過去類似シグナル成績")
+        st.subheader("🧪 v15｜過去類似シグナル成績")
         st.caption("短期スクリーニングランキング上位銘柄について、過去時点の株価・出来高だけで類似シグナルを再現します。財務(C)は将来情報混入を避けるため、この簡易検証には含めません。")
         bt_rows=[]
         for _, rr in tech.head(min(bt_top_n,len(tech))).iterrows():
@@ -1049,4 +1438,4 @@ if st.session_state.run_scan_v10:
         st.download_button("📥 短期スクリーニングランキングをCSV保存",csv,f"短期スクリーニングランキング_{market_label}.csv","text/csv",use_container_width=True)
 
 st.divider()
-st.caption("v14は信頼性監査・UI整理版です。独自短期スクリーニングは生成AIではなくルールベースです。スコアやS/A/B評価は上昇確率・勝率ではありません。楽天証券注文ナビは注文種類を明示し、投資判断・約定・将来の値上がりを保証しません。")
+st.caption("v17は短期2モードに加え、🏦長期・年初来安値モードを追加しました。長期モードは安値接近度と企業クオリティを分けて評価し、年初来安値だからという理由だけでは買い判定しません。")
