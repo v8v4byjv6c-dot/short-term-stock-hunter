@@ -12,7 +12,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.6.2",
+    page_title="短期上昇株ハンター v19.6.3",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -329,46 +329,52 @@ def select_market_universe(all_u, market):
 # ------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def download_batch(tickers, period):
-    out = {}
-    tickers = list(tickers)
-    for s in range(0, len(tickers), 100):
-        chunk = tickers[s:s+100]
-        try:
-            d = yf.download(
-                chunk,
-                period=period,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                repair=True,
-                progress=False,
-                threads=True,
-            )
-            if d is None or d.empty:
-                continue
-            if len(chunk) == 1 and not isinstance(d.columns, pd.MultiIndex):
-                out[chunk[0]] = d.copy()
-            elif isinstance(d.columns, pd.MultiIndex):
-                l0 = set(d.columns.get_level_values(0))
-                l1 = set(d.columns.get_level_values(1))
-                if any(t in l0 for t in chunk):
-                    for t in chunk:
-                        if t in l0:
-                            x = d[t].dropna(how="all")
-                            if not x.empty: out[t] = x
-                else:
-                    for t in chunk:
-                        if t in l1:
-                            x = d.xs(t, axis=1, level=1).dropna(how="all")
-                            if not x.empty: out[t] = x
-        except Exception:
-            pass
+    """
+    v19.6.3: 全対象を1回の yf.download() で取得。
+    100銘柄ずつの逐次16回通信を廃止し、取得フェーズの長時間化を防ぐ。
+    repair=False: repair=True は追加の価格修復処理を伴い大規模一括取得では重いため無効。
+    """
+    tickers=list(dict.fromkeys(tickers))
+    out={}
+    if not tickers:
+        return out
+    try:
+        d=yf.download(
+            tickers,
+            period=period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            repair=False,
+            progress=False,
+            threads=True,
+            timeout=15,
+        )
+        if d is None or d.empty:
+            return out
+        if len(tickers)==1 and not isinstance(d.columns,pd.MultiIndex):
+            out[tickers[0]]=d.dropna(how="all").copy()
+        elif isinstance(d.columns,pd.MultiIndex):
+            l0=set(d.columns.get_level_values(0))
+            l1=set(d.columns.get_level_values(1))
+            if any(t in l0 for t in tickers):
+                for t in tickers:
+                    if t in l0:
+                        x=d[t].dropna(how="all")
+                        if not x.empty: out[t]=x
+            else:
+                for t in tickers:
+                    if t in l1:
+                        x=d.xs(t,axis=1,level=1).dropna(how="all")
+                        if not x.empty: out[t]=x
+    except Exception:
+        pass
     return out
 
 @st.cache_data(ttl=120, show_spinner=False)
 def latest_jp_market_date():
     try:
-        d=yf.Ticker("^N225").history(period="10d",interval="1d",auto_adjust=False,repair=True)
+        d=yf.download("^N225",period="10d",interval="1d",auto_adjust=False,repair=False,progress=False,threads=False,timeout=8)
         if d is None or d.empty: return None
         return pd.Timestamp(d.index[-1]).tz_localize(None).date()
     except Exception: return None
@@ -379,7 +385,7 @@ def _frame_last_date(d):
 
 def refresh_lagging_tickers(data,tickers,market_date):
     """
-    v19.6.2: 高速版。
+    v19.6.3: 高速版。
     全銘柄の個別再取得は行わない。一括取得結果の日付だけ監査し、
     市場基準日より古い銘柄を返す。古い銘柄はランキングから除外する。
     """
@@ -538,7 +544,7 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
 
 
 # ------------------------------------------------------------
-# v19.6.2 銘柄診断・データ鮮度
+# v19.6.3 銘柄診断・データ鮮度
 # ------------------------------------------------------------
 def business_day_age(last_date):
     """今日までの平日ベースの概算経過日数。祝日は考慮しないため警告用の目安。"""
@@ -1409,13 +1415,13 @@ def mode_cache_key(mode_name, selected_markets):
 
 def get_mode_cache(mode_name, selected_markets):
     key = mode_cache_key(mode_name, selected_markets)
-    return st.session_state.get("scan_cache_v1962", {}).get(key)
+    return st.session_state.get("scan_cache_v1963", {}).get(key)
 
 def set_mode_cache(mode_name, selected_markets, payload):
-    if "scan_cache_v1962" not in st.session_state:
-        st.session_state.scan_cache_v1962 = {}
+    if "scan_cache_v1963" not in st.session_state:
+        st.session_state.scan_cache_v1963 = {}
     key = mode_cache_key(mode_name, selected_markets)
-    st.session_state.scan_cache_v1962[key] = payload
+    st.session_state.scan_cache_v1963[key] = payload
 
 def cache_age_text(ts):
     if ts is None:
@@ -1996,7 +2002,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.6.2")
+st.title("🎯 短期上昇株ハンター v19.6.3")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -2194,8 +2200,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
-if "scan_cache_v1962" not in st.session_state:
-    st.session_state.scan_cache_v1962 = {}
+if "scan_cache_v1963" not in st.session_state:
+    st.session_state.scan_cache_v1963 = {}
 if "holdings_v18" not in st.session_state:
     st.session_state.holdings_v18 = []
 if "last_individual_v18" not in st.session_state:
@@ -2369,7 +2375,7 @@ with btn1:
 with btn2:
     if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
         key = mode_cache_key(mode, selected_markets)
-        st.session_state.scan_cache_v1962.pop(key, None)
+        st.session_state.scan_cache_v1963.pop(key, None)
         cache_payload = None
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
@@ -2445,7 +2451,7 @@ if st.session_state.run_scan_v10:
     status=st.empty()
     progress=st.progress(0)
     status.info(f"① {market_label}の株価データを取得しています…")
-    st.caption("⚡ v19.6.2：全銘柄の個別再取得を廃止。一括取得＋鮮度監査で高速化しています。")
+    st.caption("⚡ v19.6.3：全銘柄の個別再取得を廃止。一括取得＋鮮度監査で高速化しています。")
     data=download_batch(universe.ticker.tolist(),period)
     market_data_date=latest_jp_market_date()
     data,stale_tickers=refresh_lagging_tickers(data,universe.ticker.tolist(),market_data_date)
@@ -2813,7 +2819,7 @@ if st.session_state.run_scan_v10:
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
 
-        # v19.6.2 データ鮮度監査
+        # v19.6.3 データ鮮度監査
         if "データ最終日" in tech.columns:
             age_series = tech["データ最終日"].apply(business_day_age)
             stale_count = int((age_series.fillna(999) >= 2).sum())
