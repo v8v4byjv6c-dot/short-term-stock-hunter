@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v17.5",
+    page_title="短期上昇株ハンター v17.6",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -575,6 +575,109 @@ def long_buy_plan(r):
 
 
 
+
+# ------------------------------------------------------------
+# v17.6 実戦ランキングのカラム説明
+# ------------------------------------------------------------
+def practical_ranking_column_config():
+    """実戦ランキングの全カラムにヘッダー説明を付ける。"""
+    return {
+        "順位": st.column_config.NumberColumn(
+            "順位",
+            help="短期総合スコア・買いやすさなどをもとに並べた現在のランキング順位です。順位そのものが上昇確率を意味するわけではありません。",
+            format="%d",
+        ),
+        "実戦優先度": st.column_config.TextColumn(
+            "実戦優先度",
+            help="現在のセットアップと買いやすさから、実際に注文候補として扱いやすいかを整理した表示です。🟢注文候補 / 🟡条件待ち / 🟠押し待ち / 🔴見送り・監視。"
+        ),
+        "銘柄": st.column_config.TextColumn(
+            "銘柄",
+            help="東証の銘柄コードと銘柄名です。"
+        ),
+        "Yahoo!チャート": st.column_config.LinkColumn(
+            "チャート",
+            help="Yahoo!ファイナンスの該当銘柄チャートを開きます。アプリの数値だけで決めず、実際の値動き・出来高・高値安値も確認するためのリンクです。",
+            display_text="Yahoo! ↗"
+        ),
+        "株価": st.column_config.NumberColumn(
+            "現在値",
+            help="取得できた最新の日足終値です。リアルタイム株価を保証する値ではありません。",
+            format="%.0f円"
+        ),
+        "前日比": st.column_config.NumberColumn(
+            "前日比",
+            help="最新の日足終値と、その1営業日前の終値との差額です。プラスなら前日終値より上、マイナスなら下です。",
+            format="%+.0f円"
+        ),
+        "前日比%": st.column_config.NumberColumn(
+            "前日比%",
+            help="前日終値に対する現在値の騰落率です。例：+2.00%なら前日終値から約2%上昇しています。短期の勢いを見る基本情報です。",
+            format="%+.2f%%"
+        ),
+        "短期総合スコア": st.column_config.ProgressColumn(
+            "短期スコア",
+            help="独自ルールで『上昇力』と『今の買いやすさ』を統合した0〜100点の評価です。上昇確率や勝率ではありません。高いほど、短期上昇候補としての条件が多く揃っています。",
+            min_value=0,max_value=100,format="%.1f"
+        ),
+        "セットアップ": st.column_config.TextColumn(
+            "セットアップ",
+            help="現在のチャートがどの形に近いかを表します。例：🔥ブレイク準備中、🚀ブレイク直後、🎯75日線押し目、📈モメンタム継続など。注文方法を決める重要な分類です。"
+        ),
+        "ルール評価": st.column_config.TextColumn(
+            "ルール評価",
+            help="独自短期ルールの総合評価です。S/A/B/C等はアプリ内の条件に基づく段階評価で、将来の勝率や上昇確率を表す格付けではありません。"
+        ),
+        "注文種類": st.column_config.TextColumn(
+            "注文種類",
+            help="現在のセットアップに対して楽天証券で想定する買い注文の種類です。『買い逆指値』は上抜け確認後に買う、『買い指値』は押し目まで待って買う、『注文しない』は条件未達を意味します。"
+        ),
+        "注文価格表示": st.column_config.TextColumn(
+            "注文価格",
+            help="買い注文を出す場合の参考価格です。買い逆指値なら『○円以上になったら』の条件価格、買い指値なら『○円付近まで下がったら』の待ち価格です。"
+        ),
+        "損切り価格表示": st.column_config.TextColumn(
+            "損切り",
+            help="買い約定後に設定する売り逆指値の参考価格です。ATRや75日線・ブレイク水準などから機械的に計算した目安で、絶対的な正解価格ではありません。"
+        ),
+        "利確目安①表示": st.column_config.TextColumn(
+            "利確①",
+            help="買値と損切り価格の差を1R（1単位のリスク）として、原則2R上を第一利確の参考値として表示します。将来到達する価格を予測しているわけではありません。"
+        ),
+        "RR": st.column_config.NumberColumn(
+            "RR",
+            help="リスクリワード比です。『想定利益幅 ÷ 想定損失幅』。例：2.00なら、損失幅1に対して利益幅2を狙う設計です。高ければ必ず良いわけではなく、到達可能性も合わせて判断します。",
+            format="%.2f"
+        ),
+        "決算警告": st.column_config.TextColumn(
+            "決算警告",
+            help="取得できた次回決算予定日が近い場合の注意表示です。決算直前は値動きが急変しやすいため、短期注文の前に確認します。空欄は『決算が遠い』ではなく、予定日未取得の場合もあります。"
+        ),
+    }
+
+def practical_ranking_explainer():
+    with st.expander("❓ 実戦ランキングの各カラムの見方"):
+        st.markdown("""
+- **順位**：現在の独自短期ランキング順位。上昇確率ではありません。
+- **実戦優先度**：今すぐ注文候補か、条件待ち・押し待ち・見送りかを整理した表示。
+- **銘柄 / チャート**：銘柄コード・名称とYahoo!チャートへのリンク。
+- **現在値**：取得できた最新の日足終値。リアルタイム保証ではありません。
+- **前日比 / 前日比%**：1営業日前の終値から、今日どれだけ動いたか。
+- **短期スコア**：トレンド・出来高・モメンタム・業績・買い位置・過熱リスクなどを統合した独自スコア。**勝率ではありません**。
+- **セットアップ**：ブレイク準備、ブレイク直後、75日線押し目など、現在のチャートの型。
+- **ルール評価**：S/A/B/C等の独自段階評価。統計的な格付けではありません。
+- **注文種類**：楽天証券での参考注文。**買い逆指値＝上抜け確認、買い指値＝押し待ち**。
+- **注文価格**：その注文を出す場合の条件価格または指値候補。
+- **損切り**：約定後の売り逆指値の参考値。
+- **利確①**：基本的に損切り幅の2倍（2R）を狙う第一利確参考値。
+- **RR**：利益幅 ÷ 損失幅。2.00ならリスク1に対して利益2を狙う設計。
+- **決算警告**：決算予定が近い場合の注意。空欄でも予定日を取得できていない場合があります。
+
+**見る順番のおすすめ**：  
+`実戦優先度 → 前日比 → 短期スコア → セットアップ → 注文種類 → 注文価格 → 損切り → RR → チャート確認`
+""")
+
+
 # ------------------------------------------------------------
 # v17.4 ネットワーク取得の並列化
 # ------------------------------------------------------------
@@ -800,7 +903,7 @@ def backtest_current_ai_logic(d, slope_days=20, breakout_days=60, horizon=5, tar
         "平均最大下落%":float(bt.max_down.mean()),
     }
 
-st.title("🎯 短期上昇株ハンター v17.5")
+st.title("🎯 短期上昇株ハンター v17.6")
 st.write("同じURLの中で、**📘 本ベース A/B/C/D** と **🧪 独自短期・独自統合スクリーナー**を切り替えられます。")
 
 mode = st.radio(
@@ -1341,15 +1444,9 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
         st.dataframe(
             tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],
             use_container_width=True,hide_index=True,
-            column_config={
-                "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
-                "株価":st.column_config.NumberColumn("現在値",format="%.0f円"),
-                "前日比":st.column_config.NumberColumn("前日比",format="%+.0f円"),
-                "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
-                "短期総合スコア":st.column_config.ProgressColumn("短期スコア",min_value=0,max_value=100,format="%.1f"),
-                "RR":st.column_config.NumberColumn("RR",format="%.2f"),
-            }
+            column_config=practical_ranking_column_config()
         )
+        practical_ranking_explainer()
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
                 tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","注文条件","注文理由","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
@@ -1676,8 +1773,13 @@ if st.session_state.run_scan_v10:
 
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
-        st.dataframe(tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],use_container_width=True,hide_index=True,
-            column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),"株価":st.column_config.NumberColumn("現在値",format="%.0f円"),"前日比":st.column_config.NumberColumn("前日比",format="%+.0f円"),"前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),"短期総合スコア":st.column_config.ProgressColumn("短期スコア",min_value=0,max_value=100,format="%.1f"),"RR":st.column_config.NumberColumn("RR",format="%.2f")})
+        st.dataframe(
+            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config=practical_ranking_column_config()
+        )
+        practical_ranking_explainer()
         st.warning("買い逆指値＝上抜け確認、買い指値＝押し待ち、売り逆指値＝約定後の損切り。株価データはリアルタイム保証ではありません。")
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
