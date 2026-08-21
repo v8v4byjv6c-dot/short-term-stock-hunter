@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v17.6",
+    page_title="短期上昇株ハンター v18",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -576,6 +576,183 @@ def long_buy_plan(r):
 
 
 
+
+# ------------------------------------------------------------
+# v18 保有銘柄・個別分析
+# ------------------------------------------------------------
+def holding_management_analysis(r, buy_price=None, shares=None):
+    """
+    保有者目線のルールベース診断。
+    新規買い評価とは分け、買値・現在値・移動平均・ATRから
+    保有継続/注意/利確検討/トレンド崩れを整理する。
+    """
+    current=float(r["株価"])
+    ma25=float(r["25日線"])
+    ma75=float(r["75日線"])
+    slope=float(r["75日線_比較期間前比%"])
+    dev=float(r["75日線_乖離率%"])
+    r5=float(r["5日騰落率%"])
+    r20=float(r["20日騰落率%"])
+    atr=float(r["ATR14"]) if np.isfinite(r.get("ATR14",np.nan)) else current*0.03
+    recent_high=float(r["高値"]) if np.isfinite(r.get("高値",np.nan)) else current
+
+    bp=float(buy_price) if buy_price is not None and float(buy_price)>0 else np.nan
+    qty=int(shares) if shares is not None and float(shares)>0 else 0
+
+    pnl_pct=(current/bp-1)*100 if np.isfinite(bp) else np.nan
+    pnl_yen=(current-bp)*qty if np.isfinite(bp) and qty>0 else np.nan
+
+    # 保有管理用の逆指値参考。
+    # 上昇トレンド中は25日線を優先し、弱い場合は75日線を基準にする。
+    if current > ma25 and slope > 0:
+        trend_stop = ma25 - 0.5*atr
+        stop_basis = "25日線 - 0.5ATR"
+    else:
+        trend_stop = ma75 - 0.5*atr
+        stop_basis = "75日線 - 0.5ATR"
+
+    # 現在値より上になることは避ける。
+    manage_stop=min(trend_stop, current-tick_size(current))
+    if np.isfinite(bp):
+        # 含み益がある場合は、買値から極端に遠い損切りになりすぎないよう
+        # 2ATR下も候補にして高い方を採用。
+        entry_risk_stop=bp-2*atr
+        manage_stop=max(manage_stop, entry_risk_stop)
+        manage_stop=min(manage_stop, current-tick_size(current))
+
+    # 次の利確参考は現在値からATR基準。予測ではなく管理目安。
+    take1=current+1.5*atr
+    take2=current+3.0*atr
+
+    if current <= ma75 and slope < 0:
+        holding_grade="🔴 トレンド崩れ"
+        holding_comment="株価が75日線以下で、75日線も下向き。保有継続の前提を再確認したい状態です。"
+    elif current < ma25 and r5 < 0:
+        holding_grade="🟠 要注意"
+        holding_comment="25日線を下回り、直近5日も弱い状態。売り逆指値の位置を確認したい局面です。"
+    elif np.isfinite(pnl_pct) and pnl_pct >= 5 and dev >= 12:
+        holding_grade="🟡 一部利確を検討"
+        holding_comment="含み益があり、75日線からの上方乖離も大きめ。全部売る判断ではなく、一部利確や逆指値引き上げを検討しやすい状態です。"
+    elif slope > 0 and current > ma25:
+        holding_grade="🟢 保有継続候補"
+        holding_comment="75日線が上向きで株価も25日線より上。短期トレンドは維持していると判定します。"
+    else:
+        holding_grade="⚪ 中立・監視"
+        holding_comment="明確な上昇継続・崩れのどちらにも寄っていません。チャートと次のトリガーを確認します。"
+
+    return {
+        "保有評価":holding_grade,
+        "保有コメント":holding_comment,
+        "含み損益%":pnl_pct,
+        "含み損益円":pnl_yen,
+        "管理用売り逆指値":manage_stop,
+        "管理用逆指値根拠":stop_basis,
+        "次の利確参考①":take1,
+        "次の利確参考②":take2,
+    }
+
+def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
+    code_norm=normalize_code(code_value)
+    if not code_norm:
+        st.error("4桁の銘柄コードを入力してください。")
+        return None
+
+    hit=all_u[all_u["コード"]==code_norm]
+    if hit.empty:
+        st.error(f"{code_norm} を東証銘柄一覧で確認できませんでした。")
+        return None
+
+    meta=hit.iloc[0]
+    ticker=meta["ticker"]
+    dmap=download_batch([ticker],"1y")
+    d=dmap.get(ticker)
+    if d is None or d.empty:
+        st.error("株価データを取得できませんでした。")
+        return None
+
+    r=technical_scan(d,20,3.0,60,0.35,2)
+    if not r:
+        st.error("分析に必要な株価データが不足しています。")
+        return None
+
+    r.update({
+        "ticker":ticker,
+        "コード":code_norm,
+        "銘柄名":meta["銘柄名"],
+        "銘柄":meta["銘柄"],
+        "Yahoo!チャート":meta["Yahoo!チャート"],
+    })
+
+    # 決算モメンタムと次回決算予定は1銘柄だけ取得。
+    fin=financial_momentum(ticker)
+    r.update(fin or {})
+    if "C" not in r:
+        r["C"]=False
+    if "Cスコア" not in r:
+        r["Cスコア"]=0
+
+    ai=ai_scores(r)
+    h=holding_management_analysis(r,buy_price,shares)
+    earnings=get_earnings_date_info(ticker)
+
+    st.subheader(f"🔎 {r['銘柄']}｜個別分析")
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("現在値",f"{r['株価']:.0f}円",f"{r['前日比']:+.0f}円 / {r['前日比%']:+.2f}%")
+    if buy_price and float(buy_price)>0:
+        c2.metric("取得単価",f"{float(buy_price):.0f}円",f"{h['含み損益%']:+.2f}%")
+    else:
+        c2.metric("取得単価","未入力")
+    if shares and int(shares)>0 and np.isfinite(h["含み損益円"]):
+        c3.metric("保有株数",f"{int(shares):,}株",f"損益 {h['含み損益円']:+,.0f}円")
+    else:
+        c3.metric("保有株数","未入力")
+    c4.metric("保有評価",h["保有評価"])
+
+    st.info(f"**保有者目線：{h['保有評価']}**  {h['保有コメント']}")
+
+    st.markdown("### 📌 新規買い評価と保有評価を分けて確認")
+    summary=pd.DataFrame([{
+        "現在のセットアップ":ai["セットアップ"],
+        "新規買いのルール評価":ai["ルール評価"],
+        "短期スコア":ai["短期総合スコア"],
+        "今の買いやすさ":ai["今の買いやすさ"],
+        "保有者としての評価":h["保有評価"],
+        "決算警告":earnings.get("warning",""),
+    }])
+    st.dataframe(summary,use_container_width=True,hide_index=True)
+
+    st.markdown("### 📱 楽天証券｜保有後の管理参考")
+    manage=pd.DataFrame([{
+        "売り逆指値参考":f"{h['管理用売り逆指値']:.0f}円以下",
+        "根拠":h["管理用逆指値根拠"],
+        "利確参考①":f"{h['次の利確参考①']:.0f}円",
+        "利確参考②":f"{h['次の利確参考②']:.0f}円",
+        "現在の新規買い注文":ai["注文種類"],
+        "新規買い価格":ai["注文価格表示"],
+    }])
+    st.dataframe(manage,use_container_width=True,hide_index=True)
+    st.caption("売り逆指値・利確参考はルールベースの管理目安です。現在の保有状況や許容損失に応じて調整してください。")
+
+    with st.expander("📊 テクニカル詳細"):
+        detail=pd.DataFrame([{
+            "現在値":r["株価"],
+            "25日線":r["25日線"],
+            "75日線":r["75日線"],
+            "75日線傾き%":r["75日線_比較期間前比%"],
+            "75日線乖離%":r["75日線_乖離率%"],
+            "5日騰落率%":r["5日騰落率%"],
+            "20日騰落率%":r["20日騰落率%"],
+            "60日騰落率%":r["60日騰落率%"],
+            "出来高倍率":r["出来高_20日平均比"],
+            "ATR14%":r["ATR14%"],
+        }])
+        st.dataframe(detail,use_container_width=True,hide_index=True)
+        st.link_button("Yahoo!チャートを開く",r["Yahoo!チャート"])
+
+    return {"metrics":r,"ai":ai,"holding":h,"earnings":earnings}
+
+
+
 # ------------------------------------------------------------
 # v17.6 実戦ランキングのカラム説明
 # ------------------------------------------------------------
@@ -903,17 +1080,17 @@ def backtest_current_ai_logic(d, slope_days=20, breakout_days=60, horizon=5, tar
         "平均最大下落%":float(bt.max_down.mean()),
     }
 
-st.title("🎯 短期上昇株ハンター v17.6")
-st.write("同じURLの中で、**📘 本ベース A/B/C/D** と **🧪 独自短期・独自統合スクリーナー**を切り替えられます。")
+st.title("🎯 短期上昇株ハンター v18")
+st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
     "分析モード",
-    ["📘 本ベース A/B/C/D", "🧪 独自短期・独自統合スクリーナー", "🏦 長期・年初来安値"],
+    ["📘 本ベース A/B/C/D", "🧪 独自短期・独自統合スクリーナー", "🏦 長期・年初来安値", "🔎 保有銘柄・個別分析"],
     horizontal=True,
-    help="短期2モードと、年初来安値付近の優良株を探す長期モードを同じURLで切り替えます。"
+    help="ランキング3モードに加えて、買った銘柄を保有者目線で個別分析・管理できます。"
 )
 
-with st.expander("ℹ️ 3つのモードの違い"):
+with st.expander("ℹ️ 4つのモードの違い"):
     st.markdown("""
 **📘 本ベース A/B/C/D**  
 これまで育ててきたロジックです。Aは参考書の「75日線が上向き・株価は75日線より下・75日線上抜けで買う」を中心にしています。B/C/Dは補助戦略です。
@@ -935,6 +1112,10 @@ with st.expander("ℹ️ 3つのモードの違い"):
 年初来安値に近い銘柄を探しつつ、**安いだけでは買わない**長期モードです。  
 時価総額・ROE・利益率・成長率・配当・PER/PBRなど、取得できるファンダメンタルを合わせて「長期候補 / 分割買い候補 / 安い理由を要確認」を判定します。  
 短期売買とは混ぜず、長期の分割購入を前提に表示します。
+
+**🔎 保有銘柄・個別分析**  
+銘柄コード・取得単価・保有株数を入れて、**新規で買う判断とは別に、保有者として継続・注意・一部利確・トレンド崩れを判定**します。  
+保有銘柄を登録して一覧管理することもできます。
 """)
 
 with st.sidebar:
@@ -1062,6 +1243,10 @@ with st.sidebar:
             help="何を変える？：現在値が年初来安値から何％以内なら『安値に近い』候補として重点表示するかです。小さくすると年初来安値ギリギリの銘柄に厳しく絞り、大きくすると候補範囲を広げます。例：10%なら年初来安値から10%以内です。"
         )
 
+    elif mode.startswith("🔎"):
+        st.subheader("🔎 個別分析設定")
+        st.info("個別分析では左側の細かいスキャン設定は不要です。銘柄コード・取得単価・保有株数はメイン画面で入力します。分析には1年分の日足を使用します。")
+
 try:
     all_u = get_jpx_universe()
 except Exception as e:
@@ -1074,6 +1259,72 @@ if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
 if "scan_cache_v173" not in st.session_state:
     st.session_state.scan_cache_v173 = {}
+if "holdings_v18" not in st.session_state:
+    st.session_state.holdings_v18 = []
+if "last_individual_v18" not in st.session_state:
+    st.session_state.last_individual_v18 = None
+
+# ------------------------------------------------------------
+# v18 保有銘柄・個別分析モード
+# ------------------------------------------------------------
+if mode.startswith("🔎"):
+    st.subheader("🔎 保有銘柄・個別分析")
+    st.caption("ランキングとは別に、買った後の銘柄を『保有者目線』で分析します。外部AI APIは使わず、株価・移動平均・出来高・ATR・決算データをルールベースで文章化します。")
+
+    tab1,tab2=st.tabs(["🔎 1銘柄を分析","📋 保有銘柄一覧"])
+
+    with tab1:
+        with st.form("individual_analysis_form"):
+            c1,c2,c3=st.columns(3)
+            code_input=c1.text_input("銘柄コード",value=(st.session_state.last_individual_v18 or {}).get("code","7267"),help="東証の4桁銘柄コードを入力します。例：本田技研工業は7267。")
+            buy_input=c2.number_input("取得単価（円）",min_value=0.0,value=float((st.session_state.last_individual_v18 or {}).get("buy_price",0.0)),step=1.0,help="実際に買った平均取得単価です。未保有・新規分析なら0円のままでも分析できます。")
+            shares_input=c3.number_input("保有株数",min_value=0,value=int((st.session_state.last_individual_v18 or {}).get("shares",0)),step=100,help="保有している株数です。入力すると含み損益金額を計算します。")
+            add_holding=st.checkbox("分析後、この銘柄を保有一覧に登録/更新する",value=False)
+            submitted=st.form_submit_button("🔍 個別分析する",type="primary",use_container_width=True)
+
+        if submitted:
+            st.session_state.last_individual_v18={"code":code_input,"buy_price":buy_input,"shares":shares_input}
+            if add_holding and normalize_code(code_input):
+                norm=normalize_code(code_input)
+                new_item={"code":norm,"buy_price":float(buy_input),"shares":int(shares_input)}
+                existing=[x for x in st.session_state.holdings_v18 if x["code"]!=norm]
+                existing.append(new_item)
+                st.session_state.holdings_v18=existing
+
+        last=st.session_state.last_individual_v18
+        if last:
+            render_single_holding_analysis(all_u,last["code"],last["buy_price"],last["shares"])
+        else:
+            st.info("銘柄コードを入力して「個別分析する」を押してください。")
+
+    with tab2:
+        st.markdown("### 📋 登録済み保有銘柄")
+        if not st.session_state.holdings_v18:
+            st.info("まだ保有銘柄が登録されていません。『1銘柄を分析』から登録できます。")
+        else:
+            basic=[]
+            for h in st.session_state.holdings_v18:
+                hit=all_u[all_u["コード"]==h["code"]]
+                name=hit.iloc[0]["銘柄名"] if not hit.empty else ""
+                basic.append({"コード":h["code"],"銘柄名":name,"取得単価":h["buy_price"],"保有株数":h["shares"]})
+            st.dataframe(pd.DataFrame(basic),use_container_width=True,hide_index=True)
+
+            selected_code=st.selectbox(
+                "詳しく分析する保有銘柄",
+                [x["code"] for x in st.session_state.holdings_v18],
+                format_func=lambda c: next((f"{c} {r['銘柄名']}" for _,r in all_u[all_u["コード"]==c].iterrows()),c)
+            )
+            selected=next(x for x in st.session_state.holdings_v18 if x["code"]==selected_code)
+            render_single_holding_analysis(all_u,selected["code"],selected["buy_price"],selected["shares"])
+
+            st.divider()
+            del_code=st.selectbox("保有一覧から削除する銘柄",[x["code"] for x in st.session_state.holdings_v18],key="delete_holding_code")
+            if st.button("🗑️ 選択した保有銘柄を削除"):
+                st.session_state.holdings_v18=[x for x in st.session_state.holdings_v18 if x["code"]!=del_code]
+                st.rerun()
+
+    st.warning("個別分析は売買を自動執行する機能ではありません。『新規買い評価』と『保有者としての評価』を意図的に分けています。")
+    st.stop()
 
 st.subheader("🏢 スキャンする市場")
 st.caption("複数選択できます。例：プライム＋スタンダード。初期設定はプライムのみです。")
