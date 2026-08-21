@@ -10,7 +10,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v17",
+    page_title="短期上昇株ハンター v17.3",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -572,6 +572,57 @@ def long_buy_plan(r):
     })
 
 
+
+# ------------------------------------------------------------
+# v17.3 モード別セッション保持
+# ------------------------------------------------------------
+def mode_cache_key(mode_name, selected_markets):
+    """モード＋市場の組み合わせごとに結果を分離して保持する。"""
+    markets = tuple(sorted(selected_markets or []))
+    return f"{mode_name}::{markets}"
+
+def get_mode_cache(mode_name, selected_markets):
+    key = mode_cache_key(mode_name, selected_markets)
+    return st.session_state.get("scan_cache_v173", {}).get(key)
+
+def set_mode_cache(mode_name, selected_markets, payload):
+    if "scan_cache_v173" not in st.session_state:
+        st.session_state.scan_cache_v173 = {}
+    key = mode_cache_key(mode_name, selected_markets)
+    st.session_state.scan_cache_v173[key] = payload
+
+def cache_age_text(ts):
+    if ts is None:
+        return ""
+    try:
+        now = pd.Timestamp.now()
+        t = pd.Timestamp(ts)
+        sec = max(0, int((now - t).total_seconds()))
+        if sec < 60:
+            return f"{sec}秒前"
+        mins = sec // 60
+        if mins < 60:
+            return f"{mins}分前"
+        return f"{mins//60}時間{mins%60}分前"
+    except Exception:
+        return ""
+
+def cached_result_banner(payload):
+    if not payload:
+        return
+    ts = payload.get("timestamp")
+    age = cache_age_text(ts)
+    label = pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts is not None else "不明"
+    if ts is not None:
+        mins = max(0, int((pd.Timestamp.now() - pd.Timestamp(ts)).total_seconds() // 60))
+    else:
+        mins = 999
+    if mins >= 10:
+        st.warning(f"前回取得：{label}（{age}）。10分以上経過しているため、必要なら再スキャンしてください。")
+    else:
+        st.info(f"前回取得：{label}（{age}）。モード切替後もこの結果を保持しています。")
+
+
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
@@ -722,7 +773,7 @@ def backtest_current_ai_logic(d, slope_days=20, breakout_days=60, horizon=5, tar
         "平均最大下落%":float(bt.max_down.mean()),
     }
 
-st.title("🎯 短期上昇株ハンター v17")
+st.title("🎯 短期上昇株ハンター v17.3")
 st.write("同じURLの中で、**📘 本ベース A/B/C/D** と **🧪 独自短期・独自統合スクリーナー**を切り替えられます。")
 
 mode = st.radio(
@@ -757,43 +808,96 @@ with st.expander("ℹ️ 3つのモードの違い"):
 """)
 
 with st.sidebar:
-    st.header("共通設定")
-    pl = st.selectbox("株価をさかのぼる期間",["6か月","1年","2年"],index=1)
-    period = {"6か月":"6mo","1年":"1y","2年":"2y"}[pl]
-    slope_days = st.slider(
-        "75日線が上向きかを判断する期間", 5, 40, 20, 1,
-        help="20なら、現在の75日線が20営業日前より高いかを判定します。"
-    )
-    max_dev = st.slider("A：75日線から下に離れてよい範囲",1.0,10.0,5.0,0.5)
-    buy_ticks = st.slider("A：75日線を何ティック上抜けたら買い候補か",1,5,2,1)
-    a_stop_buffer_pct = st.slider("A：75日線割れの損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%")
-    breakout_days = st.slider("高値更新を見る期間",20,120,60,10)
-    c_check_count = st.slider("決算を詳しく確認する上位銘柄数",30,200,100,10)
-    st.divider()
-    st.subheader("v13 検証設定")
-    bt_top_n = st.slider("バックテストする上位銘柄数",5,30,10,5, help="処理時間を抑えるため、短期スクリーニングランキング上位だけを検証します。")
-    bt_horizon = st.selectbox("何営業日先まで検証するか",[5,10,20],index=0)
-    bt_target = st.selectbox("上昇目標",[3.0,5.0,8.0,10.0],index=1,format_func=lambda x:f"+{x:.0f}%")
-    bt_stop = st.selectbox("下落警戒ライン",[2.0,3.0,5.0],index=1,format_func=lambda x:f"-{x:.0f}%")
+    st.header("設定")
 
-    if mode.startswith("🏦"):
+    # まず内部既定値を定義。表示しないモードでも技術計算関数が安全に動くようにする。
+    period = "1y"
+    slope_days = 20
+    max_dev = 3.0
+    buy_ticks = 2
+    a_stop_buffer_pct = 0.35
+    breakout_days = 60
+    c_check_count = 100
+    bt_top_n = 10
+    bt_horizon = 5
+    bt_target = 5.0
+    bt_stop = 3.0
+    long_fund_n = 80
+    long_mcap_filter = "5,000億円以上"
+    long_max_low_dist = 10
+
+    if mode.startswith("📘"):
+        st.subheader("📘 本ベース設定")
+        pl = st.selectbox("株価をさかのぼる期間",["6か月","1年","2年"],index=1)
+        period = {"6か月":"6mo","1年":"1y","2年":"2y"}[pl]
+
+        slope_days = st.slider(
+            "75日線が上向きかを判断する期間", 5, 40, 20, 1,
+            help="20なら、現在の75日線が20営業日前より高いかを判定します。"
+        )
+
+        st.info("Aの75日線乖離条件は **-3%〜0%で固定** です。v16以降、本の考え方に寄せて深い押しはA対象から除外しています。")
+
+        buy_ticks = st.slider(
+            "A：反転確認を何ティック上抜けで判定するか", 1, 5, 2, 1,
+            help="75日線付近に来ただけでは買わず、前日高値＋指定ティック超えを反転確認とします。"
+        )
+        a_stop_buffer_pct = st.slider(
+            "A：75日線割れの損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%"
+        )
+        breakout_days = st.slider("B：高値更新を見る期間",20,120,60,10)
+        c_check_count = st.slider("C：決算を詳しく確認する上位銘柄数",30,200,100,10)
+
+    elif mode.startswith("🧪"):
+        st.subheader("🧪 独自短期設定")
+        pl = st.selectbox("株価をさかのぼる期間",["6か月","1年","2年"],index=1)
+        period = {"6か月":"6mo","1年":"1y","2年":"2y"}[pl]
+
+        slope_days = st.slider(
+            "75日線トレンド判定期間", 5, 40, 20, 1,
+            help="独自短期スコアで75日線の方向を評価する期間です。"
+        )
+        buy_ticks = st.slider(
+            "押し目反転確認ティック数", 1, 5, 2, 1,
+            help="独自短期の押し目セットアップで反転確認に使います。"
+        )
+        a_stop_buffer_pct = st.slider(
+            "押し目の損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%"
+        )
+        breakout_days = st.slider("ブレイク判定期間",20,120,60,10)
+        c_check_count = st.slider("決算を詳しく確認する上位銘柄数",30,200,100,10)
+
         st.divider()
-        st.subheader("長期・年初来安値設定")
+        st.subheader("過去類似シグナル検証")
+        bt_top_n = st.slider(
+            "検証する上位銘柄数",5,30,10,5,
+            help="処理時間を抑えるため、独自短期ランキング上位だけを検証します。"
+        )
+        bt_horizon = st.selectbox("何営業日先まで検証するか",[5,10,20],index=0)
+        bt_target = st.selectbox("上昇目標",[3.0,5.0,8.0,10.0],index=1,format_func=lambda x:f"+{x:.0f}%")
+        bt_stop = st.selectbox("下落警戒ライン",[2.0,3.0,5.0],index=1,format_func=lambda x:f"-{x:.0f}%")
+
+    elif mode.startswith("🏦"):
+        st.subheader("🏦 長期・年初来安値設定")
+        st.caption("短期売買用の75日線・ブレイク・バックテスト設定は長期モードでは表示しません。")
+
+        # 年初来安値を正しく見るため、少なくとも1年分を取得。
+        period = "1y"
+        st.info("株価取得期間は **1年固定**。年初来安値を1月から確認するためです。")
+
         long_fund_n = st.slider(
             "ファンダメンタルを確認する上位銘柄数",
             20, 150, 80, 10,
-            help="年初来安値に近い順に候補を絞り、上位だけ時価総額・ROE・配当等を取得します。増やすほど時間がかかります。"
+            help="年初来安値に近い順で上位候補だけ、時価総額・ROE・配当などを詳しく取得します。"
         )
         long_mcap_filter = st.selectbox(
             "大手企業フィルター",
             ["制限なし","1,000億円以上","5,000億円以上","1兆円以上"],
-            index=2,
-            help="長期モードの『大手』タブや総合候補に使います。"
+            index=2
         )
         long_max_low_dist = st.slider(
             "年初来安値から何%以内を重点表示するか",
-            1, 30, 10, 1,
-            help="10%なら、現在値が年初来安値から+10%以内の銘柄を重点候補にします。"
+            1, 30, 10, 1
         )
 
 try:
@@ -806,6 +910,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
+if "scan_cache_v173" not in st.session_state:
+    st.session_state.scan_cache_v173 = {}
 
 st.subheader("🏢 スキャンする市場")
 st.caption("複数選択できます。例：プライム＋スタンダード。初期設定はプライムのみです。")
@@ -851,8 +957,20 @@ with st.expander("地合い判定の内訳"):
 if not selected_markets:
     st.warning("市場を1つ以上選択してください。")
 
-if st.button(f"🚀 {market_label}をスキャン", type="primary", use_container_width=True, disabled=not selected_markets):
-    st.session_state.run_scan_v10=True
+cache_payload = get_mode_cache(mode, selected_markets)
+
+btn1, btn2 = st.columns([4,1])
+with btn1:
+    if st.button(f"🚀 {market_label}をスキャン", type="primary", use_container_width=True, disabled=not selected_markets):
+        st.session_state.run_scan_v10=True
+with btn2:
+    if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
+        key = mode_cache_key(mode, selected_markets)
+        st.session_state.scan_cache_v173.pop(key, None)
+        cache_payload = None
+
+if cache_payload is not None and not st.session_state.run_scan_v10:
+    cached_result_banner(cache_payload)
 
 def ai_pre_score(r):
     slope=float(r["75日線_比較期間前比%"])
@@ -1102,6 +1220,73 @@ def ai_scores(r):
         "想定利益%":reward_pct,"RR":rr,"実戦優先度":practical_priority,
     })
 
+if not st.session_state.run_scan_v10 and cache_payload is not None:
+    # 前回の結果を復元
+    cached_mode = cache_payload.get("mode")
+    if cached_mode == "book":
+        ranked = cache_payload["ranked"].copy()
+        tech = cache_payload["tech"].copy()
+        st.subheader("📘 本ベース｜総合ランキング")
+        st.caption("前回スキャン結果を表示しています。必要なときだけ再スキャンしてください。")
+        st.dataframe(
+            ranked[["順位","銘柄","Yahoo!チャート","株価","前日比","前日比%","75日線","75日線_乖離率%","A","B","C","D","該当戦略数","買い価格目安","A初期損切り目安","B初期損切り目安","総合スコア","総合診断"]],
+            use_container_width=True,hide_index=True,
+            column_config={
+                "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
+                "株価":st.column_config.NumberColumn("株価",format="%.0f円"),
+                "前日比":st.column_config.NumberColumn("前日比",format="%+.0f円"),
+                "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
+                "75日線":st.column_config.NumberColumn("75日線",format="%.0f円"),
+                "75日線_乖離率%":st.column_config.NumberColumn("75日線乖離",format="%+.2f%%"),
+                "買い価格目安":st.column_config.NumberColumn("買い目安",format="%.0f円"),
+                "A初期損切り目安":st.column_config.NumberColumn("A損切り",format="%.0f円"),
+                "B初期損切り目安":st.column_config.NumberColumn("B損切り",format="%.0f円"),
+                "総合スコア":st.column_config.NumberColumn("総合",format="%.1f"),
+            }
+        )
+        st.stop()
+
+    elif cached_mode == "ai":
+        tech = cache_payload["tech"].copy()
+        st.subheader("📊 実戦ランキング")
+        st.caption("前回スキャン結果を表示しています。モード切替では再取得しません。")
+        st.dataframe(
+            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],
+            use_container_width=True,hide_index=True,
+            column_config={
+                "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
+                "株価":st.column_config.NumberColumn("現在値",format="%.0f円"),
+                "前日比":st.column_config.NumberColumn("前日比",format="%+.0f円"),
+                "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
+                "短期総合スコア":st.column_config.ProgressColumn("短期スコア",min_value=0,max_value=100,format="%.1f"),
+                "RR":st.column_config.NumberColumn("RR",format="%.2f"),
+            }
+        )
+        with st.expander("🔎 詳細を見る"):
+            st.dataframe(
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","注文条件","注文理由","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                use_container_width=True,hide_index=True
+            )
+        st.stop()
+
+    elif cached_mode == "long":
+        long_df = cache_payload["long_df"].copy()
+        st.subheader("🏦 長期・年初来安値｜総合候補")
+        st.caption("前回スキャン結果を表示しています。モード切替では再取得しません。")
+        st.dataframe(
+            long_df.head(100)[["順位","長期判定","銘柄","Yahoo!チャート","株価","前日比%","年初来安値","年初来安値日","年初来安値から%","安値接近度","企業クオリティ","配当・割安度","長期総合スコア","時価総額_億円","配当利回り%","ROE%","予想PER","PBR","長期買い方","1回目","2回目","3回目"]],
+            use_container_width=True,hide_index=True,
+            column_config={
+                "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
+                "株価":st.column_config.NumberColumn("現在値",format="%.0f円"),
+                "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
+                "年初来安値":st.column_config.NumberColumn("年初来安値",format="%.0f円"),
+                "年初来安値から%":st.column_config.NumberColumn("安値から",format="%+.2f%%"),
+                "長期総合スコア":st.column_config.ProgressColumn("長期総合",min_value=0,max_value=100,format="%.1f"),
+            }
+        )
+        st.stop()
+
 if st.session_state.run_scan_v10:
     st.session_state.run_scan_v10=False
     if universe.empty:
@@ -1186,6 +1371,11 @@ if st.session_state.run_scan_v10:
         ).reset_index(drop=True)
         long_df.insert(0,"順位",np.arange(1,len(long_df)+1))
         status.success("長期・年初来安値ランキングを作成しました。")
+        set_mode_cache(mode, selected_markets, {
+            "mode":"long",
+            "timestamp":pd.Timestamp.now(),
+            "long_df":long_df.copy(),
+        })
 
         st.subheader("🏦 長期・年初来安値｜総合候補")
         st.caption("『安い＝買い』ではありません。年初来安値への近さと、取得できた企業クオリティ・配当/バリュエーションを分けて評価します。ファンダメンタルは年初来安値接近上位だけ取得するため、全上場銘柄を完全比較するものではありません。")
@@ -1341,6 +1531,13 @@ if st.session_state.run_scan_v10:
             tech[s]=tech[s].map(mark)
         ranked=tech[tech["該当戦略数"]>=1]
 
+        set_mode_cache(mode, selected_markets, {
+            "mode":"book",
+            "timestamp":pd.Timestamp.now(),
+            "tech":tech.copy(),
+            "ranked":ranked.copy(),
+        })
+
         st.subheader("📘 本ベース｜総合ランキング")
         st.caption("Aは『75日線が上向き』『株価が75日線の下』『乖離率 -3%〜0%』に限定。0%に近いほど高評価です。Aの買い目安は前日高値＋指定ティック超えによる反転確認価格です。")
         st.dataframe(
@@ -1382,13 +1579,28 @@ if st.session_state.run_scan_v10:
         elif regime["score"] < 60:
             tech["評価コメント"] = tech["評価コメント"].astype(str) + "／地合い中立"
 
+        set_mode_cache(mode, selected_markets, {
+            "mode":"ai",
+            "timestamp":pd.Timestamp.now(),
+            "tech":tech.copy(),
+        })
+
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
         st.dataframe(tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","注文価格表示","損切り価格表示","利確目安①表示","RR","決算警告"]],use_container_width=True,hide_index=True,
             column_config={"Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),"株価":st.column_config.NumberColumn("現在値",format="%.0f円"),"前日比":st.column_config.NumberColumn("前日比",format="%+.0f円"),"前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),"短期総合スコア":st.column_config.ProgressColumn("短期スコア",min_value=0,max_value=100,format="%.1f"),"RR":st.column_config.NumberColumn("RR",format="%.2f")})
         st.warning("買い逆指値＝上抜け確認、買い指値＝押し待ち、売り逆指値＝約定後の損切り。株価データはリアルタイム保証ではありません。")
         with st.expander("🔎 詳細を見る"):
-            st.dataframe(tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高倍率","75日線","75日線傾き%","75日線乖離%","追加シグナル","注文条件","注文理由","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],use_container_width=True,hide_index=True)
+            st.dataframe(
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","注文条件","注文理由","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "出来高_20日平均比":st.column_config.NumberColumn("出来高倍率",format="%.2f倍"),
+                    "75日線_比較期間前比%":st.column_config.NumberColumn("75日線傾き",format="%+.2f%%"),
+                    "75日線_乖離率%":st.column_config.NumberColumn("75日線乖離",format="%+.2f%%"),
+                }
+            )
 
         st.subheader("🧪 v15｜過去類似シグナル成績")
         st.caption("短期スクリーニングランキング上位銘柄について、過去時点の株価・出来高だけで類似シグナルを再現します。財務(C)は将来情報混入を避けるため、この簡易検証には含めません。")
