@@ -1,6 +1,7 @@
 
 import io
 import re
+import math
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -11,7 +12,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.4",
+    page_title="短期上昇株ハンター v19.4.1",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -1654,7 +1655,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.4")
+st.title("🎯 短期上昇株ハンター v19.4.1")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
