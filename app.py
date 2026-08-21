@@ -2,6 +2,7 @@
 import io
 import re
 from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -10,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v17.3",
+    page_title="短期上昇株ハンター v17.5",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -149,7 +150,7 @@ def select_market_universe(all_u, market):
 # ------------------------------------------------------------
 # Yahoo Finance 株価
 # ------------------------------------------------------------
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def download_batch(tickers, period):
     out = {}
     tickers = list(tickers)
@@ -573,6 +574,32 @@ def long_buy_plan(r):
 
 
 
+
+# ------------------------------------------------------------
+# v17.4 ネットワーク取得の並列化
+# ------------------------------------------------------------
+def parallel_fetch(tickers, func, max_workers=6):
+    """
+    yfinanceの銘柄別取得を少数スレッドで並列化。
+    過剰アクセスを避けるため既定6並列。失敗銘柄は空dictで返す。
+    """
+    tickers = list(tickers)
+    results = {}
+    if not tickers:
+        return results
+
+    workers = max(1, min(max_workers, len(tickers)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(func, t): t for t in tickers}
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                results[t] = fut.result() or {}
+            except Exception:
+                results[t] = {}
+    return results
+
+
 # ------------------------------------------------------------
 # v17.3 モード別セッション保持
 # ------------------------------------------------------------
@@ -630,7 +657,7 @@ def cached_result_banner(payload):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_market_regime():
-    """TOPIXと日経平均のトレンドから、短期売買の地合いを簡易判定する。"""
+    """TOPIXと日経平均の移動平均線・直近騰落から、市場トレンドを簡易判定する。"""
     out = []
     for ticker, name in [("^TOPX", "TOPIX"), ("^N225", "日経平均")]:
         try:
@@ -661,13 +688,13 @@ def get_market_regime():
 
     score = sum(x["地合い点"] for x in out) / len(out)
     if score >= 80:
-        label, comment = "🟢 強気", "個別株の買いシグナルを通常どおり評価しやすい地合いです。"
+        label, comment = "🟢 強気", "日経平均・TOPIXとも上昇トレンドが強い状態です。"
     elif score >= 60:
-        label, comment = "🟡 やや強気", "買い候補は選別しつつ、通常サイズを検討できる地合いです。"
+        label, comment = "🟡 やや強気", "主要指数は概ね上向きですが、一部条件は未達です。"
     elif score >= 40:
-        label, comment = "🟠 中立", "新規買いはトリガー確認を重視し、追いかけ買いを避けたい地合いです。"
+        label, comment = "🟠 中立", "主要指数のトレンドが混在しています。"
     else:
-        label, comment = "🔴 弱気", "新規買いを厳選し、ポジションを小さめにすることを検討したい地合いです。"
+        label, comment = "🔴 弱気", "日経平均・TOPIXのトレンド条件が弱い状態です。"
     return {"label":label, "score":score, "comment":comment, "details":out}
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -773,7 +800,7 @@ def backtest_current_ai_logic(d, slope_days=20, breakout_days=60, horizon=5, tar
         "平均最大下落%":float(bt.max_down.mean()),
     }
 
-st.title("🎯 短期上昇株ハンター v17.3")
+st.title("🎯 短期上昇株ハンター v17.5")
 st.write("同じURLの中で、**📘 本ベース A/B/C/D** と **🧪 独自短期・独自統合スクリーナー**を切り替えられます。")
 
 mode = st.radio(
@@ -828,54 +855,83 @@ with st.sidebar:
 
     if mode.startswith("📘"):
         st.subheader("📘 本ベース設定")
-        pl = st.selectbox("株価をさかのぼる期間",["6か月","1年","2年"],index=1)
+        pl = st.selectbox(
+            "株価をさかのぼる期間", ["6か月","1年","2年"], index=1,
+            help="何を変える？：スキャンに使う過去の株価データ量です。長くすると過去の値動きを多く参照できますが、取得データ量が増えて処理が重くなる場合があります。"
+        )
         period = {"6か月":"6mo","1年":"1y","2年":"2y"}[pl]
 
         slope_days = st.slider(
             "75日線が上向きかを判断する期間", 5, 40, 20, 1,
-            help="20なら、現在の75日線が20営業日前より高いかを判定します。"
+            help="何を変える？：75日移動平均線が上向きかを、何営業日前の75日線と比較して判定するかです。小さくすると最近の変化に敏感になり、大きくするとより中期的な傾向を重視します。例：20なら現在と20営業日前の75日線を比較します。"
         )
 
         st.info("Aの75日線乖離条件は **-3%〜0%で固定** です。v16以降、本の考え方に寄せて深い押しはA対象から除外しています。")
 
         buy_ticks = st.slider(
             "A：反転確認を何ティック上抜けで判定するか", 1, 5, 2, 1,
-            help="75日線付近に来ただけでは買わず、前日高値＋指定ティック超えを反転確認とします。"
+            help="何を変える？：本ベースAで『押し目から反転した』と判断する買いトリガーの厳しさです。前日高値を何ティック上抜けたら反転確認とするかを指定します。大きくすると慎重になり、小さくすると早めに反応します。"
         )
         a_stop_buffer_pct = st.slider(
-            "A：75日線割れの損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%"
+            "A：75日線割れの損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%",
+            help="何を変える？：本ベースAの損切り参考値を75日線から何％下に置くかです。大きくすると値動きへの余裕は増えますが、損切り時の損失幅も広がります。例：0.35%なら75日線の0.35%下を目安にします。"
         )
-        breakout_days = st.slider("B：高値更新を見る期間",20,120,60,10)
-        c_check_count = st.slider("C：決算を詳しく確認する上位銘柄数",30,200,100,10)
+        breakout_days = st.slider(
+            "B：高値更新を見る期間",20,120,60,10,
+            help="何を変える？：本ベースBで、過去何営業日の高値をブレイク基準にするかです。小さくすると短期的な高値更新を拾いやすく、大きくするとより大きな節目の突破を重視します。例：60なら過去60営業日の高値を基準にします。"
+        )
+        c_check_count = st.slider(
+            "C：決算を詳しく確認する上位銘柄数",30,200,100,10,
+            help="何を変える？：事前ランキング上位のうち、決算データを追加取得してC判定まで行う銘柄数です。増やすほど広く確認できますが、個別データ取得が増えるためスキャン時間も長くなります。"
+        )
 
     elif mode.startswith("🧪"):
         st.subheader("🧪 独自短期設定")
-        pl = st.selectbox("株価をさかのぼる期間",["6か月","1年","2年"],index=1)
+        pl = st.selectbox(
+            "株価をさかのぼる期間", ["6か月","1年","2年"], index=1,
+            help="何を変える？：スキャンに使う過去の株価データ量です。長くすると過去の値動きを多く参照できますが、取得データ量が増えて処理が重くなる場合があります。"
+        )
         period = {"6か月":"6mo","1年":"1y","2年":"2y"}[pl]
 
         slope_days = st.slider(
             "75日線トレンド判定期間", 5, 40, 20, 1,
-            help="独自短期スコアで75日線の方向を評価する期間です。"
+            help="何を変える？：独自短期で75日線の方向を見る比較期間です。小さくすると最近のトレンド変化に敏感になり、大きくすると中期的な方向を重視します。例：20なら現在の75日線と20営業日前を比較します。"
         )
         buy_ticks = st.slider(
             "押し目反転確認ティック数", 1, 5, 2, 1,
-            help="独自短期の押し目セットアップで反転確認に使います。"
+            help="何を変える？：独自短期の押し目候補で、前日高値を何ティック上抜けたら『反転確認』とするかです。大きくするとダマシを避けやすい反面、買い判定は遅くなります。小さくすると早めに反応します。"
         )
         a_stop_buffer_pct = st.slider(
-            "押し目の損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%"
+            "押し目の損切りバッファ",0.10,2.00,0.35,0.05,format="%.2f%%",
+            help="何を変える？：独自短期の押し目候補で、75日線から何％下を損切り参考値にするかです。大きくすると値動きへの許容幅が広がりますが、損失幅も大きくなります。"
         )
-        breakout_days = st.slider("ブレイク判定期間",20,120,60,10)
-        c_check_count = st.slider("決算を詳しく確認する上位銘柄数",30,200,100,10)
+        breakout_days = st.slider(
+            "ブレイク判定期間",20,120,60,10,
+            help="何を変える？：独自短期で過去何営業日の高値をブレイク基準にするかです。小さくすると短期の高値更新を拾いやすく、大きくするとより強い節目の突破を重視します。例：60なら過去60営業日の高値を基準にします。"
+        )
+        c_check_count = st.slider(
+            "決算を詳しく確認する上位銘柄数",30,200,100,10,
+            help="何を変える？：独自短期の上位候補のうち、決算情報を詳しく取得する銘柄数です。増やすほど決算面を広く確認できますが、Yahoo Financeへの個別取得が増えるためスキャン時間も長くなります。"
+        )
 
         st.divider()
         st.subheader("過去類似シグナル検証")
         bt_top_n = st.slider(
             "検証する上位銘柄数",5,30,10,5,
-            help="処理時間を抑えるため、独自短期ランキング上位だけを検証します。"
+            help="何を変える？：独自短期ランキングの上位何銘柄まで過去類似シグナルを検証するかです。増やすほど検証対象は広がりますが、バックテスト処理も重くなります。"
         )
-        bt_horizon = st.selectbox("何営業日先まで検証するか",[5,10,20],index=0)
-        bt_target = st.selectbox("上昇目標",[3.0,5.0,8.0,10.0],index=1,format_func=lambda x:f"+{x:.0f}%")
-        bt_stop = st.selectbox("下落警戒ライン",[2.0,3.0,5.0],index=1,format_func=lambda x:f"-{x:.0f}%")
+        bt_horizon = st.selectbox(
+            "何営業日先まで検証するか",[5,10,20],index=0,
+            help="何を変える？：過去に類似シグナルが出た後、何営業日先までの値動きを検証対象にするかです。5日は約1週間、10日は約2週間、20日は約1か月のイメージです。"
+        )
+        bt_target = st.selectbox(
+            "上昇目標",[3.0,5.0,8.0,10.0],index=1,format_func=lambda x:f"+{x:.0f}%",
+            help="何を変える？：過去類似シグナル検証で『上昇成功』と見る目標率です。例：+5%なら、設定した検証期間内にシグナル価格から5%以上上昇したかを確認します。高くすると成功条件が厳しくなります。"
+        )
+        bt_stop = st.selectbox(
+            "下落警戒ライン",[2.0,3.0,5.0],index=1,format_func=lambda x:f"-{x:.0f}%",
+            help="何を変える？：過去類似シグナル検証で『下落警戒』と見る下落率です。例：-3%ならシグナル価格から3%下落したかを確認します。小さい値ほど下落に厳しい判定になります。"
+        )
 
     elif mode.startswith("🏦"):
         st.subheader("🏦 長期・年初来安値設定")
@@ -888,16 +944,19 @@ with st.sidebar:
         long_fund_n = st.slider(
             "ファンダメンタルを確認する上位銘柄数",
             20, 150, 80, 10,
-            help="年初来安値に近い順で上位候補だけ、時価総額・ROE・配当などを詳しく取得します。"
+            help="何を変える？：年初来安値に近い候補のうち、時価総額・ROE・配当・PER・PBRなどを詳しく取得する上位銘柄数です。増やすほど候補を広く調べられますが、長期モードでは特に処理時間へ影響します。"
+
         )
         long_mcap_filter = st.selectbox(
             "大手企業フィルター",
             ["制限なし","1,000億円以上","5,000億円以上","1兆円以上"],
-            index=2
+            index=2,
+            help="何を変える？：長期候補として残す企業の最低時価総額です。大きくすると大型株中心に絞り込みます。「制限なし」では時価総額による除外を行いません。"
         )
         long_max_low_dist = st.slider(
             "年初来安値から何%以内を重点表示するか",
-            1, 30, 10, 1
+            1, 30, 10, 1,
+            help="何を変える？：現在値が年初来安値から何％以内なら『安値に近い』候補として重点表示するかです。小さくすると年初来安値ギリギリの銘柄に厳しく絞り、大きくすると候補範囲を広げます。例：10%なら年初来安値から10%以内です。"
         )
 
 try:
@@ -915,6 +974,18 @@ if "scan_cache_v173" not in st.session_state:
 
 st.subheader("🏢 スキャンする市場")
 st.caption("複数選択できます。例：プライム＋スタンダード。初期設定はプライムのみです。")
+with st.expander("⚡ スキャン速度について"):
+    st.markdown("""
+v17.4では次を高速化しています。
+
+- 株価データは**30分キャッシュ**し、同じ市場・取得期間なら再利用
+- 決算データ、決算予定日、長期ファンダメンタルは**最大6銘柄ずつ並列取得**
+- 長期モードでは不要な短期テクニカル計算を省略
+- モード別の前回スキャン結果はセッション内で保持
+
+それでも時間がかかる主因は、Yahoo Financeへ銘柄ごとに取得する**決算・企業情報**です。  
+速度優先ならサイドバーの「決算を詳しく確認する上位銘柄数」「ファンダメンタルを確認する上位銘柄数」を減らしてください。
+""")
 
 market_options = ["プライム", "スタンダード", "グロース", "TOKYO PRO"]
 selected_markets = st.multiselect(
@@ -945,10 +1016,27 @@ m3.metric("モード", "本ベース" if mode.startswith("📘") else ("長期�
 
 regime = get_market_regime()
 if mode.startswith("🏦"):
-    st.info(f"**短期地合い（長期では参考）：{regime['label']}**  長期モードでは地合い点より、企業の質と年初来安値への接近を重視します。")
+    st.info(f"**市場トレンド（長期では参考）：{regime['label']}**  長期モードでは市場トレンドより、企業の質と年初来安値への接近を重視します。")
 else:
-    st.info(f"**市場地合い：{regime['label']}（{regime['score']:.0f}/100）**  {regime['comment']}")
-with st.expander("地合い判定の内訳"):
+    st.info(f"**市場トレンド：{regime['label']}（{regime['score']:.0f}/100）**  {regime['comment']}")
+
+with st.expander("📐 市場トレンド判定の仕組み"):
+    st.markdown("""
+**TOPIXと日経平均をそれぞれ100点満点で採点し、2指数の平均を表示します。**
+
+- 現在値 ＞ 20日移動平均線：**+35点**
+- 20日移動平均線 ＞ 75日移動平均線：**+30点**
+- 75日移動平均線が10営業日前より上昇：**+25点**
+- 直近5営業日の騰落率がプラス：**+10点**
+
+**総合判定**
+- 80点以上：🟢 強気
+- 60〜79点：🟡 やや強気
+- 40〜59点：🟠 中立
+- 40点未満：🔴 弱気
+
+これは日経平均・TOPIXの**トレンド状態**を見る独自ルールです。市場心理や騰落銘柄数などを含む広義の「地合い」全体を表す指標ではありません。
+""")
     if regime["details"]:
         st.dataframe(pd.DataFrame(regime["details"]), use_container_width=True, hide_index=True)
     else:
@@ -1302,16 +1390,18 @@ if st.session_state.run_scan_v10:
     for i,row in universe.reset_index(drop=True).iterrows():
         d=data.get(row.ticker)
         if d is not None:
-            r=technical_scan(d,slope_days,max_dev,breakout_days,a_stop_buffer_pct,buy_ticks)
+            if mode.startswith("🏦"):
+                # 長期モードでは短期テクニカル計算を省略し、年初来安値計算だけ実施。
+                r=long_price_metrics(d)
+            else:
+                r=technical_scan(d,slope_days,max_dev,breakout_days,a_stop_buffer_pct,buy_ticks)
+
             if r:
                 r.update({
                     "ticker":row.ticker,"コード":row["コード"],"銘柄名":row["銘柄名"],
                     "銘柄":row["銘柄"],"市場":row["市場"],"業種":row["業種"],
                     "Yahoo!チャート":row["Yahoo!チャート"]
                 })
-                lm = long_price_metrics(d)
-                if lm:
-                    r.update(lm)
                 rows.append(r)
         if i%20==0:
             progress.progress(min(.68,(i+1)/max(total,1)*.68))
@@ -1337,10 +1427,10 @@ if st.session_state.run_scan_v10:
     if mode.startswith("🏦"):
         status.info("② 年初来安値に近い候補の企業情報を確認しています…")
         fund_n=min(long_fund_n, len(tech))
-        f_map={}
-        for j,t in enumerate(tech.head(fund_n).ticker):
-            f_map[t]=long_term_fundamentals(t)
-            progress.progress(.68+(j+1)/max(fund_n,1)*.32)
+        fund_tickers=tech.head(fund_n).ticker.tolist()
+        status.info(f"② 年初来安値に近い上位{fund_n}銘柄の企業情報を並列取得しています…")
+        f_map=parallel_fetch(fund_tickers, long_term_fundamentals, max_workers=6)
+        progress.progress(1.0)
         progress.empty()
 
         fund_rows=[]
@@ -1466,11 +1556,11 @@ if st.session_state.run_scan_v10:
         st.warning("長期モードは『年初来安値だから買う』機能ではありません。業績悪化・減配・構造的な競争力低下などで安値になっている可能性があります。分割購入案は参考値で、損失を限定するものではありません。")
         st.stop()
 
-    status.info("② 上位候補の決算データを確認しています…")
-    n=min(c_check_count,len(tech)); cmap={}
-    for j,t in enumerate(tech.head(n).ticker):
-        cmap[t]=financial_momentum(t)
-        progress.progress(.68+(j+1)/max(n,1)*.32)
+    n=min(c_check_count,len(tech))
+    c_tickers=tech.head(n).ticker.tolist()
+    status.info(f"② 上位{n}銘柄の決算データを並列取得しています…")
+    cmap=parallel_fetch(c_tickers, financial_momentum, max_workers=6)
+    progress.progress(1.0)
     progress.empty()
 
     tech["C"]=[cmap.get(t,{}).get("C",False) for t in tech.ticker]
@@ -1566,18 +1656,17 @@ if st.session_state.run_scan_v10:
         tech.insert(0,"順位",np.arange(1,len(tech)+1))
 
         # 決算日警告：上位候補だけ取得して速度を維持
-        earnings_infos = {}
-        for t in tech.head(min(30,len(tech))).ticker:
-            earnings_infos[t] = get_earnings_date_info(t)
+        earnings_tickers=tech.head(min(30,len(tech))).ticker.tolist()
+        earnings_infos=parallel_fetch(earnings_tickers, get_earnings_date_info, max_workers=6)
         tech["次回決算日"] = [earnings_infos.get(t,{}).get("date") for t in tech.ticker]
         tech["決算まで日数"] = [earnings_infos.get(t,{}).get("days") for t in tech.ticker]
         tech["決算警告"] = [earnings_infos.get(t,{}).get("warning","") for t in tech.ticker]
 
         # 地合いを診断コメントへ反映
         if regime["score"] < 40:
-            tech["評価コメント"] = tech["評価コメント"].astype(str) + "／地合い弱気のため新規買いは厳選"
+            tech["評価コメント"] = tech["評価コメント"].astype(str) + "／市場トレンド弱気のため新規買いは厳選"
         elif regime["score"] < 60:
-            tech["評価コメント"] = tech["評価コメント"].astype(str) + "／地合い中立"
+            tech["評価コメント"] = tech["評価コメント"].astype(str) + "／市場トレンド中立"
 
         set_mode_cache(mode, selected_markets, {
             "mode":"ai",
