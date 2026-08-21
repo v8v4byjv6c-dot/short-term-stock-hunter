@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v18",
+    page_title="短期上昇株ハンター v18.0.1",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -1080,7 +1080,259 @@ def backtest_current_ai_logic(d, slope_days=20, breakout_days=60, horizon=5, tar
         "平均最大下落%":float(bt.max_down.mean()),
     }
 
-st.title("🎯 短期上昇株ハンター v18")
+# ------------------------------------------------------------
+# v18.0.1 独自短期スコア関数（UIより先に定義）
+# ------------------------------------------------------------
+def ai_pre_score(r):
+    slope=float(r["75日線_比較期間前比%"])
+    r20=float(r["20日騰落率%"])
+    r60=float(r["60日騰落率%"])
+    vr=float(r["出来高_20日平均比"])
+    dev=float(r["75日線_乖離率%"])
+    ext=float(r["Bブレイク上昇率%"]) if np.isfinite(r["Bブレイク上昇率%"]) else -99
+
+    trend = np.clip(45 + slope*10 + (10 if r["株価25日線比%"]>0 else -10),0,100)
+    volume = np.clip(35 + (vr-1)*45,0,100)
+    momentum = np.clip(40 + r20*2 + r60*.6,0,100)
+    entry = 35
+    if -3 <= dev < 0 and slope>0: entry=90
+    elif -3 <= ext <= 0 and vr>=1.1 and slope>0: entry=92
+    elif 0 < ext <= 3 and vr>=1.3: entry=85
+    elif 0 <= dev <= 10 and slope>0: entry=65
+    risk = 90
+    if dev>10: risk-=15
+    if dev>20: risk-=25
+    if dev>30: risk-=25
+    if ext>5: risk-=15
+    if ext>10: risk-=25
+    if np.isfinite(r["ATR14%"]) and r["ATR14%"]>5: risk-=15
+    risk=np.clip(risk,0,100)
+    return .30*trend+.25*volume+.20*momentum+.15*entry+.10*risk
+
+def ai_scores(r):
+    slope=float(r["75日線_比較期間前比%"])
+    r5=float(r["5日騰落率%"])
+    r20=float(r["20日騰落率%"])
+    r60=float(r["60日騰落率%"])
+    vr=float(r["出来高_20日平均比"])
+    dev=float(r["75日線_乖離率%"])
+    ext=float(r["Bブレイク上昇率%"]) if np.isfinite(r["Bブレイク上昇率%"]) else np.nan
+    atrp=float(r["ATR14%"]) if np.isfinite(r["ATR14%"]) else np.nan
+    trading=float(r["売買代金_億円"]) if np.isfinite(r["売買代金_億円"]) else 0
+    cscore=float(r.get("Cスコア",0) or 0)
+
+    trend=np.clip(40+slope*10+(15 if r["株価25日線比%"]>0 else -10)+(10 if r60>10 else 0),0,100)
+    volume=np.clip(30+(vr-1)*40+min(20,np.log10(max(trading,0.1))*8),0,100)
+    momentum=np.clip(40+r20*2+r60*.7+r5*1.5,0,100)
+    earnings=np.clip(cscore,0,100)
+
+    # Entry quality
+    entry=30
+    setup="監視"
+    if slope>0 and -3<=dev<0:
+        entry=92; setup="🎯 押し目・75日線接近"
+    if np.isfinite(ext) and -3<=ext<=0 and slope>0 and vr>=1.1:
+        entry=max(entry,95); setup="🔥 ブレイク準備中"
+    elif np.isfinite(ext) and 0<ext<=3 and vr>=1.3 and slope>0:
+        entry=max(entry,88); setup="🚀 ブレイク直後"
+    elif r60>=15 and -3<=r5<=5 and 0<=dev<=12 and slope>0:
+        entry=max(entry,72); setup="📈 モメンタム継続"
+    if bool(r.get("C",False)) and r20>0:
+        entry=max(entry,75)
+        if setup=="監視": setup="💹 決算加速"
+
+    signals=[]
+    if slope>0 and -3<=dev<0:
+        signals.append("🎯 押し目")
+    if np.isfinite(ext) and -3<=ext<=0 and slope>0 and vr>=1.1:
+        signals.append("🔥 ブレイク準備中")
+    if np.isfinite(ext) and 0<ext<=3 and vr>=1.3 and slope>0:
+        signals.append("🚀 ブレイク直後")
+    if bool(r.get("C",False)) and r20>0:
+        signals.append("💹 決算加速")
+    if r60>=15 and -3<=r5<=5 and 0<=dev<=12 and slope>0:
+        signals.append("📈 モメンタム継続")
+    if not signals:
+        signals=["監視"]
+
+    # Risk / overheat; higher score = safer
+    risk=95
+    if dev>10: risk-=15
+    if dev>20: risk-=25
+    if dev>30: risk-=30
+    if np.isfinite(ext) and ext>3: risk-=8
+    if np.isfinite(ext) and ext>7: risk-=20
+    if np.isfinite(ext) and ext>10: risk-=25
+    if np.isfinite(atrp) and atrp>4: risk-=10
+    if np.isfinite(atrp) and atrp>6: risk-=20
+    risk=np.clip(risk,0,100)
+
+    strength=.30*trend+.25*volume+.25*momentum+.20*earnings
+    ease=.55*entry+.45*risk
+    total=.60*strength+.40*ease
+
+    # Trigger / stop references
+    if setup.startswith("🎯"):
+        trigger=float(r["A買い価格"])
+        stop=float(r["A初期損切り"])
+    elif np.isfinite(r["Bブレイク水準"]):
+        trigger=float(r["Bブレイク水準"])+tick_size(float(r["Bブレイク水準"]))
+        if np.isfinite(r["B初期損切り"]):
+            stop=float(r["B初期損切り"])
+        else:
+            stop=trigger-(float(r["ATR14%"])/100*float(r["株価"]) if np.isfinite(r["ATR14%"]) else trigger*.03)
+    else:
+        trigger=float(r["株価"])+tick_size(float(r["株価"]))
+        stop=trigger-(float(r["ATR14%"])/100*float(r["株価"]) if np.isfinite(r["ATR14%"]) else trigger*.03)
+
+    if total>=80 and ease>=75:
+        grade="🟢 S｜最有力"
+    elif total>=70 and ease>=65:
+        grade="🟢 A｜良好"
+    elif total>=60:
+        grade="🟡 B｜候補"
+    elif strength>=70 and ease<55:
+        grade="🟠 C｜強いが今は待ち"
+    elif total>=50:
+        grade="🟡 C｜慎重"
+    else:
+        grade="⚪ 見送り"
+
+    # 楽天証券向け注文ナビ v14
+    # 「買い逆指値」と「買い指値」と「約定後の売り逆指値」を明確に分離する。
+    current=float(r["株価"])
+    atr_yen=(float(r["ATR14%"])/100*current) if np.isfinite(r["ATR14%"]) else current*.03
+    chase = (dev > 20) or (np.isfinite(ext) and ext > 7) or ease < 45
+
+    buy_order_type="注文しない"
+    buy_price=np.nan
+    buy_price_text="—"
+    buy_condition="監視"
+    stop_order_type="—"
+    stop_price=np.nan
+    order_reason=""
+
+    if chase:
+        order_reason="過熱または買いやすさ不足。現在値を追いかけず、押し目形成後に再判定。"
+
+    elif setup.startswith("🔥"):
+        # ブレイク前：上抜けを確認してから買うため「買い逆指値」
+        buy_order_type="買い逆指値"
+        buy_price=float(trigger)
+        buy_price_text=f"{buy_price:.0f}円以上"
+        buy_condition=f"株価が{buy_price:.0f}円以上になったら買い条件発動"
+        stop_order_type="売り逆指値"
+        stop_price=float(stop)
+        order_reason="まだブレイク前。上抜けを確認してから入る。"
+
+    elif setup.startswith("🚀"):
+        # ブレイク済み：すでに上抜けているため、さらに上で買う逆指値は使わず押し待ちの指値。
+        breakout=float(r["Bブレイク水準"]) if np.isfinite(r["Bブレイク水準"]) else current
+        pullback_low=max(breakout, current-0.75*atr_yen)
+        pullback_high=current-tick_size(current)
+        if pullback_low > pullback_high:
+            pullback_low=pullback_high
+        buy_order_type="買い指値"
+        buy_price=float(pullback_high)
+        buy_price_text=f"{pullback_low:.0f}〜{pullback_high:.0f}円"
+        buy_condition=f"{buy_price_text}への押しを待つ。上に飛んだ場合は追いかけない"
+        stop_order_type="売り逆指値"
+        stop_price=float(stop)
+        order_reason="ブレイク済み。新規の買い逆指値ではなく、押しを待つ指値買い。"
+
+    elif setup.startswith("🎯"):
+        # 75日線押し目：下で待つので買い指値
+        buy_order_type="買い指値"
+        buy_price=float(r["A買い価格"])
+        buy_price_text=f"{buy_price:.0f}円"
+        buy_condition=f"{buy_price:.0f}円前後への押しを待つ"
+        stop_order_type="売り逆指値"
+        stop_price=float(r["A初期損切り"])
+        order_reason="75日線付近の押し目を待って買う。"
+
+    elif setup.startswith("💹"):
+        # 決算加速だけでは注文方法を決め打ちしない。
+        buy_order_type="条件確認後"
+        buy_price=np.nan
+        buy_price_text="—"
+        buy_condition="決算加速だけで注文せず、押し目またはブレイク条件が追加で出るまで待つ"
+        stop_order_type="—"
+        stop_price=np.nan
+        order_reason="決算の良さだけを理由に注文種類を決めない。"
+
+    elif setup.startswith("📈"):
+        # モメンタム継続は高値追いを避け、明確な新トリガーが出るまで待つ。
+        buy_order_type="注文しない"
+        buy_price=np.nan
+        buy_price_text="—"
+        buy_condition="押し目または新しいブレイク準備シグナルを待つ"
+        stop_order_type="—"
+        stop_price=np.nan
+        order_reason="モメンタムだけで高値を追わない。"
+
+    else:
+        buy_order_type="注文しない"
+        buy_condition="監視継続"
+        order_reason="注文方法を一意に決められるセットアップではない。"
+
+    risk_base = buy_price if np.isfinite(buy_price) else np.nan
+    risk_pct=((stop_price/risk_base)-1)*100 if np.isfinite(risk_base) and np.isfinite(stop_price) and risk_base else np.nan
+    stop_price_text=f"{stop_price:.0f}円以下" if np.isfinite(stop_price) else "—"
+    order_summary=f"{buy_order_type}｜{buy_price_text}｜約定後 {stop_order_type} {stop_price_text}"
+    take_profit1=take_profit2=rr=reward_pct=np.nan
+    if np.isfinite(buy_price) and np.isfinite(stop_price) and buy_price > stop_price:
+        risk_yen=buy_price-stop_price
+        take_profit1=buy_price+2*risk_yen
+        take_profit2=buy_price+3*risk_yen
+        rr=2.0
+        reward_pct=(take_profit1/buy_price-1)*100
+    take_profit1_text=f"{take_profit1:.0f}円" if np.isfinite(take_profit1) else "—"
+    take_profit2_text=f"{take_profit2:.0f}円" if np.isfinite(take_profit2) else "—"
+    if buy_order_type in ["買い逆指値","買い指値"]:
+        practical_priority="🟢 注文候補" if ease>=70 else ("🟡 条件待ち" if ease>=55 else "🟠 押し待ち")
+    else:
+        practical_priority="🔴 見送り/監視"
+
+    reasons=[]
+    if trend>=75: reasons.append("上昇トレンドが強い")
+    if volume>=70: reasons.append(f"出来高{vr:.2f}倍で資金流入")
+    if momentum>=75: reasons.append("短中期モメンタムが強い")
+    if earnings>=60: reasons.append("業績モメンタムも良好")
+    if entry>=85: reasons.append(setup.replace("🎯 ","").replace("🔥 ","").replace("🚀 ",""))
+    if risk<45: reasons.append("過熱・値動きリスクが大きい")
+    comment="／".join(reasons[:4]) if reasons else "決定的な優位性はまだ弱い"
+
+    return pd.Series({
+        "短期総合スコア":total,
+        "上昇力":strength,
+        "今の買いやすさ":ease,
+        "トレンド":trend,
+        "需給・出来高":volume,
+        "モメンタム":momentum,
+        "業績":earnings,
+        "エントリー":entry,
+        "リスク":risk,
+        "セットアップ":setup,
+        "追加シグナル":"・".join(signals),
+        "ルール評価":grade,
+        "評価コメント":comment,
+        "注文種類":buy_order_type,
+        "注文価格":buy_price,
+        "注文価格表示":buy_price_text,
+        "注文条件":buy_condition,
+        "損切り注文":stop_order_type,
+        "損切り価格":stop_price,
+        "損切り価格表示":stop_price_text,
+        "想定初期リスク%":risk_pct,
+        "注文理由":order_reason,
+        "注文サマリー":order_summary,
+        "利確目安①":take_profit1,"利確目安②":take_profit2,
+        "利確目安①表示":take_profit1_text,"利確目安②表示":take_profit2_text,
+        "想定利益%":reward_pct,"RR":rr,"実戦優先度":practical_priority,
+    })
+
+
+st.title("🎯 短期上昇株ハンター v18.0.1")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -1413,254 +1665,6 @@ with btn2:
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
     cached_result_banner(cache_payload)
-
-def ai_pre_score(r):
-    slope=float(r["75日線_比較期間前比%"])
-    r20=float(r["20日騰落率%"])
-    r60=float(r["60日騰落率%"])
-    vr=float(r["出来高_20日平均比"])
-    dev=float(r["75日線_乖離率%"])
-    ext=float(r["Bブレイク上昇率%"]) if np.isfinite(r["Bブレイク上昇率%"]) else -99
-
-    trend = np.clip(45 + slope*10 + (10 if r["株価25日線比%"]>0 else -10),0,100)
-    volume = np.clip(35 + (vr-1)*45,0,100)
-    momentum = np.clip(40 + r20*2 + r60*.6,0,100)
-    entry = 35
-    if -3 <= dev < 0 and slope>0: entry=90
-    elif -3 <= ext <= 0 and vr>=1.1 and slope>0: entry=92
-    elif 0 < ext <= 3 and vr>=1.3: entry=85
-    elif 0 <= dev <= 10 and slope>0: entry=65
-    risk = 90
-    if dev>10: risk-=15
-    if dev>20: risk-=25
-    if dev>30: risk-=25
-    if ext>5: risk-=15
-    if ext>10: risk-=25
-    if np.isfinite(r["ATR14%"]) and r["ATR14%"]>5: risk-=15
-    risk=np.clip(risk,0,100)
-    return .30*trend+.25*volume+.20*momentum+.15*entry+.10*risk
-
-def ai_scores(r):
-    slope=float(r["75日線_比較期間前比%"])
-    r5=float(r["5日騰落率%"])
-    r20=float(r["20日騰落率%"])
-    r60=float(r["60日騰落率%"])
-    vr=float(r["出来高_20日平均比"])
-    dev=float(r["75日線_乖離率%"])
-    ext=float(r["Bブレイク上昇率%"]) if np.isfinite(r["Bブレイク上昇率%"]) else np.nan
-    atrp=float(r["ATR14%"]) if np.isfinite(r["ATR14%"]) else np.nan
-    trading=float(r["売買代金_億円"]) if np.isfinite(r["売買代金_億円"]) else 0
-    cscore=float(r.get("Cスコア",0) or 0)
-
-    trend=np.clip(40+slope*10+(15 if r["株価25日線比%"]>0 else -10)+(10 if r60>10 else 0),0,100)
-    volume=np.clip(30+(vr-1)*40+min(20,np.log10(max(trading,0.1))*8),0,100)
-    momentum=np.clip(40+r20*2+r60*.7+r5*1.5,0,100)
-    earnings=np.clip(cscore,0,100)
-
-    # Entry quality
-    entry=30
-    setup="監視"
-    if slope>0 and -3<=dev<0:
-        entry=92; setup="🎯 押し目・75日線接近"
-    if np.isfinite(ext) and -3<=ext<=0 and slope>0 and vr>=1.1:
-        entry=max(entry,95); setup="🔥 ブレイク準備中"
-    elif np.isfinite(ext) and 0<ext<=3 and vr>=1.3 and slope>0:
-        entry=max(entry,88); setup="🚀 ブレイク直後"
-    elif r60>=15 and -3<=r5<=5 and 0<=dev<=12 and slope>0:
-        entry=max(entry,72); setup="📈 モメンタム継続"
-    if bool(r.get("C",False)) and r20>0:
-        entry=max(entry,75)
-        if setup=="監視": setup="💹 決算加速"
-
-    signals=[]
-    if slope>0 and -3<=dev<0:
-        signals.append("🎯 押し目")
-    if np.isfinite(ext) and -3<=ext<=0 and slope>0 and vr>=1.1:
-        signals.append("🔥 ブレイク準備中")
-    if np.isfinite(ext) and 0<ext<=3 and vr>=1.3 and slope>0:
-        signals.append("🚀 ブレイク直後")
-    if bool(r.get("C",False)) and r20>0:
-        signals.append("💹 決算加速")
-    if r60>=15 and -3<=r5<=5 and 0<=dev<=12 and slope>0:
-        signals.append("📈 モメンタム継続")
-    if not signals:
-        signals=["監視"]
-
-    # Risk / overheat; higher score = safer
-    risk=95
-    if dev>10: risk-=15
-    if dev>20: risk-=25
-    if dev>30: risk-=30
-    if np.isfinite(ext) and ext>3: risk-=8
-    if np.isfinite(ext) and ext>7: risk-=20
-    if np.isfinite(ext) and ext>10: risk-=25
-    if np.isfinite(atrp) and atrp>4: risk-=10
-    if np.isfinite(atrp) and atrp>6: risk-=20
-    risk=np.clip(risk,0,100)
-
-    strength=.30*trend+.25*volume+.25*momentum+.20*earnings
-    ease=.55*entry+.45*risk
-    total=.60*strength+.40*ease
-
-    # Trigger / stop references
-    if setup.startswith("🎯"):
-        trigger=float(r["A買い価格"])
-        stop=float(r["A初期損切り"])
-    elif np.isfinite(r["Bブレイク水準"]):
-        trigger=float(r["Bブレイク水準"])+tick_size(float(r["Bブレイク水準"]))
-        if np.isfinite(r["B初期損切り"]):
-            stop=float(r["B初期損切り"])
-        else:
-            stop=trigger-(float(r["ATR14%"])/100*float(r["株価"]) if np.isfinite(r["ATR14%"]) else trigger*.03)
-    else:
-        trigger=float(r["株価"])+tick_size(float(r["株価"]))
-        stop=trigger-(float(r["ATR14%"])/100*float(r["株価"]) if np.isfinite(r["ATR14%"]) else trigger*.03)
-
-    if total>=80 and ease>=75:
-        grade="🟢 S｜最有力"
-    elif total>=70 and ease>=65:
-        grade="🟢 A｜良好"
-    elif total>=60:
-        grade="🟡 B｜候補"
-    elif strength>=70 and ease<55:
-        grade="🟠 C｜強いが今は待ち"
-    elif total>=50:
-        grade="🟡 C｜慎重"
-    else:
-        grade="⚪ 見送り"
-
-    # 楽天証券向け注文ナビ v14
-    # 「買い逆指値」と「買い指値」と「約定後の売り逆指値」を明確に分離する。
-    current=float(r["株価"])
-    atr_yen=(float(r["ATR14%"])/100*current) if np.isfinite(r["ATR14%"]) else current*.03
-    chase = (dev > 20) or (np.isfinite(ext) and ext > 7) or ease < 45
-
-    buy_order_type="注文しない"
-    buy_price=np.nan
-    buy_price_text="—"
-    buy_condition="監視"
-    stop_order_type="—"
-    stop_price=np.nan
-    order_reason=""
-
-    if chase:
-        order_reason="過熱または買いやすさ不足。現在値を追いかけず、押し目形成後に再判定。"
-
-    elif setup.startswith("🔥"):
-        # ブレイク前：上抜けを確認してから買うため「買い逆指値」
-        buy_order_type="買い逆指値"
-        buy_price=float(trigger)
-        buy_price_text=f"{buy_price:.0f}円以上"
-        buy_condition=f"株価が{buy_price:.0f}円以上になったら買い条件発動"
-        stop_order_type="売り逆指値"
-        stop_price=float(stop)
-        order_reason="まだブレイク前。上抜けを確認してから入る。"
-
-    elif setup.startswith("🚀"):
-        # ブレイク済み：すでに上抜けているため、さらに上で買う逆指値は使わず押し待ちの指値。
-        breakout=float(r["Bブレイク水準"]) if np.isfinite(r["Bブレイク水準"]) else current
-        pullback_low=max(breakout, current-0.75*atr_yen)
-        pullback_high=current-tick_size(current)
-        if pullback_low > pullback_high:
-            pullback_low=pullback_high
-        buy_order_type="買い指値"
-        buy_price=float(pullback_high)
-        buy_price_text=f"{pullback_low:.0f}〜{pullback_high:.0f}円"
-        buy_condition=f"{buy_price_text}への押しを待つ。上に飛んだ場合は追いかけない"
-        stop_order_type="売り逆指値"
-        stop_price=float(stop)
-        order_reason="ブレイク済み。新規の買い逆指値ではなく、押しを待つ指値買い。"
-
-    elif setup.startswith("🎯"):
-        # 75日線押し目：下で待つので買い指値
-        buy_order_type="買い指値"
-        buy_price=float(r["A買い価格"])
-        buy_price_text=f"{buy_price:.0f}円"
-        buy_condition=f"{buy_price:.0f}円前後への押しを待つ"
-        stop_order_type="売り逆指値"
-        stop_price=float(r["A初期損切り"])
-        order_reason="75日線付近の押し目を待って買う。"
-
-    elif setup.startswith("💹"):
-        # 決算加速だけでは注文方法を決め打ちしない。
-        buy_order_type="条件確認後"
-        buy_price=np.nan
-        buy_price_text="—"
-        buy_condition="決算加速だけで注文せず、押し目またはブレイク条件が追加で出るまで待つ"
-        stop_order_type="—"
-        stop_price=np.nan
-        order_reason="決算の良さだけを理由に注文種類を決めない。"
-
-    elif setup.startswith("📈"):
-        # モメンタム継続は高値追いを避け、明確な新トリガーが出るまで待つ。
-        buy_order_type="注文しない"
-        buy_price=np.nan
-        buy_price_text="—"
-        buy_condition="押し目または新しいブレイク準備シグナルを待つ"
-        stop_order_type="—"
-        stop_price=np.nan
-        order_reason="モメンタムだけで高値を追わない。"
-
-    else:
-        buy_order_type="注文しない"
-        buy_condition="監視継続"
-        order_reason="注文方法を一意に決められるセットアップではない。"
-
-    risk_base = buy_price if np.isfinite(buy_price) else np.nan
-    risk_pct=((stop_price/risk_base)-1)*100 if np.isfinite(risk_base) and np.isfinite(stop_price) and risk_base else np.nan
-    stop_price_text=f"{stop_price:.0f}円以下" if np.isfinite(stop_price) else "—"
-    order_summary=f"{buy_order_type}｜{buy_price_text}｜約定後 {stop_order_type} {stop_price_text}"
-    take_profit1=take_profit2=rr=reward_pct=np.nan
-    if np.isfinite(buy_price) and np.isfinite(stop_price) and buy_price > stop_price:
-        risk_yen=buy_price-stop_price
-        take_profit1=buy_price+2*risk_yen
-        take_profit2=buy_price+3*risk_yen
-        rr=2.0
-        reward_pct=(take_profit1/buy_price-1)*100
-    take_profit1_text=f"{take_profit1:.0f}円" if np.isfinite(take_profit1) else "—"
-    take_profit2_text=f"{take_profit2:.0f}円" if np.isfinite(take_profit2) else "—"
-    if buy_order_type in ["買い逆指値","買い指値"]:
-        practical_priority="🟢 注文候補" if ease>=70 else ("🟡 条件待ち" if ease>=55 else "🟠 押し待ち")
-    else:
-        practical_priority="🔴 見送り/監視"
-
-    reasons=[]
-    if trend>=75: reasons.append("上昇トレンドが強い")
-    if volume>=70: reasons.append(f"出来高{vr:.2f}倍で資金流入")
-    if momentum>=75: reasons.append("短中期モメンタムが強い")
-    if earnings>=60: reasons.append("業績モメンタムも良好")
-    if entry>=85: reasons.append(setup.replace("🎯 ","").replace("🔥 ","").replace("🚀 ",""))
-    if risk<45: reasons.append("過熱・値動きリスクが大きい")
-    comment="／".join(reasons[:4]) if reasons else "決定的な優位性はまだ弱い"
-
-    return pd.Series({
-        "短期総合スコア":total,
-        "上昇力":strength,
-        "今の買いやすさ":ease,
-        "トレンド":trend,
-        "需給・出来高":volume,
-        "モメンタム":momentum,
-        "業績":earnings,
-        "エントリー":entry,
-        "リスク":risk,
-        "セットアップ":setup,
-        "追加シグナル":"・".join(signals),
-        "ルール評価":grade,
-        "評価コメント":comment,
-        "注文種類":buy_order_type,
-        "注文価格":buy_price,
-        "注文価格表示":buy_price_text,
-        "注文条件":buy_condition,
-        "損切り注文":stop_order_type,
-        "損切り価格":stop_price,
-        "損切り価格表示":stop_price_text,
-        "想定初期リスク%":risk_pct,
-        "注文理由":order_reason,
-        "注文サマリー":order_summary,
-        "利確目安①":take_profit1,"利確目安②":take_profit2,
-        "利確目安①表示":take_profit1_text,"利確目安②表示":take_profit2_text,
-        "想定利益%":reward_pct,"RR":rr,"実戦優先度":practical_priority,
-    })
 
 if not st.session_state.run_scan_v10 and cache_payload is not None:
     # 前回の結果を復元
