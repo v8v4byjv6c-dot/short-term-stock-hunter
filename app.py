@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19",
+    page_title="短期上昇株ハンター v19.1",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -295,9 +295,10 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     D = bool(trend and r60>=10 and drawdown<=-3 and r5>0 and close>ma25)
     Ds = min(100,max(0,min(45,max(0,r60*1.5))+min(25,max(0,r5*4))+(30 if D else 0)))
     bd_buy = high + tick_size(high)
-    # Bの初期損切り参考値：ブレイク水準 - 1ATR(14)
-    # 値動きが大きい銘柄ほど余裕を持たせる。
-    b_stop = (bh - atr14) if np.isfinite(bh) and np.isfinite(atr14) else np.nan
+    # v19.1 Bの損切りは「ブレイク水準を支持線として維持できるか」を主根拠にする。
+    # ATRは損切り理由そのものではなく、日々のノイズで刈られにくくする補助バッファ。
+    b_stop_buffer = 0.5 * atr14 if np.isfinite(atr14) else (bh * 0.015 if np.isfinite(bh) else np.nan)
+    b_stop = (bh - b_stop_buffer) if np.isfinite(bh) and np.isfinite(b_stop_buffer) else np.nan
 
     return {
         "株価":close, "前日終値":prev_close, "前日比":day_change, "前日比%":day_change_pct,
@@ -831,6 +832,7 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
     st.dataframe(manage,use_container_width=True,hide_index=True)
 
     with st.expander("🧮 新規買いの注文価格・損切り・利確の根拠"):
+        st.markdown(f"**売買シナリオ：{ai['売買シナリオ']}**")
         st.markdown(f"**注文種類：{ai['注文種類']}**")
         st.write(f"**注文価格の根拠**：{ai['注文価格の根拠']}")
         st.write(f"**損切り価格の根拠**：{ai['損切り価格の根拠']}")
@@ -969,9 +971,9 @@ def practical_ranking_explainer():
 - **ルール評価**：S/A/B/C等の独自段階評価。統計的な格付けではありません。
 - **注文種類**：楽天証券での参考注文。**買い逆指値＝上抜け確認、買い指値＝押し待ち**。
 - **注文価格**：その注文を出す場合の条件価格または指値候補。
-- **注文価格の根拠**：ブレイク準備なら「ブレイク水準＋1ティック」、ブレイク直後なら「現在値から0.75ATR程度の押し」、75日線押し目なら「75日線近辺の押し目候補」など、セットアップ別に計算理由を表示。
+- **注文価格の根拠**：ブレイク準備は「ブレイク水準＋1ティック」の買い逆指値。ブレイク直後は高値を追わず「現在値から0.75ATR程度の押し」を買い指値。75日線押し目は「前日高値＋指定ティック」を上抜けて反転確認する買い逆指値。
 - **損切り**：約定後の売り逆指値の参考値。
-- **損切り価格の根拠**：ATR・75日線・ブレイク水準など、損切り参考値の算出基準を表示。
+- **損切り価格の根拠**：まず「買った理由が崩れる水準」を決めます。75日線押し目なら75日線の明確割れ、ブレイク系ならブレイク水準の支持失敗。ATRはブレイク系で日々のノイズを避ける補助バッファとしてのみ使用します。
 - **利確①**：基本的に損切り幅の2倍（2R）を狙う第一利確参考値。
 - **利確価格の根拠**：買値と損切りの差を1Rとして、利確①=2R、利確②=3Rとするリスク管理上の考え方。
 - **RR**：利益幅 ÷ 損失幅。2.00ならリスク1に対して利益2を狙う設計。
@@ -1399,7 +1401,10 @@ def ai_scores(r):
         stop_price=float(stop)
         order_reason="まだブレイク前。上抜けを確認してから入る。"
         buy_price_reason=f"直近ブレイク水準 {float(r['Bブレイク水準']):.0f}円 に1ティックを加えた {buy_price:.0f}円を条件価格にしています。高値を実際に上抜けたことを確認してから入るため『買い逆指値』です。"
-        stop_price_reason=f"ブレイク候補の初期損切り参考 {stop_price:.0f}円。ATRとブレイク水準を基準に算出した参考値です。"
+        blevel=float(r["Bブレイク水準"])
+        atr_abs=float(r["ATR14"]) if np.isfinite(r["ATR14"]) else np.nan
+        buffer_abs=(blevel-stop_price)
+        stop_price_reason=f"買いの前提は『{blevel:.0f}円の高値を突破し、その水準が支持線になること』です。損切りはブレイク水準 {blevel:.0f}円 － ノイズ回避バッファ {buffer_abs:.0f}円 ＝ {stop_price:.0f}円。バッファは原則0.5ATRで、ATRは主根拠ではなく日々の値動きに対する余裕としてだけ使います。"
 
     elif setup.startswith("🚀"):
         # ブレイク済み：すでに上抜けているため、さらに上で買う逆指値は使わず押し待ちの指値。
@@ -1415,20 +1420,22 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="ブレイク済み。新規の買い逆指値ではなく、押しを待つ指値買い。"
-        buy_price_reason=f"すでにブレイク済みなので高値を追いません。現在値 {current:.0f}円 から0.75ATR下を目安にしつつ、ブレイク水準 {breakout:.0f}円 を割らない範囲として {buy_price_text} を押し目候補にしています。"
-        stop_price_reason=f"ブレイク後の失敗に備える初期損切り参考 {stop_price:.0f}円。ATRとブレイク水準を基準にした参考値です。"
+        buy_price_reason=f"すでに {breakout:.0f}円 のブレイク水準を突破済みなので、さらに上を逆指値で追いません。現在値 {current:.0f}円 から0.75ATR程度の押しを待ちつつ、ブレイク水準 {breakout:.0f}円 より下では買わない範囲として {buy_price_text} を買い指値候補にしています。ここでのATRは『普通の押し幅』の目安です。"
+        buffer_abs=(breakout-stop_price)
+        stop_price_reason=f"ブレイク後は、突破した {breakout:.0f}円 が支持線として機能することが保有の前提です。損切りは {breakout:.0f}円 － ノイズ回避バッファ {buffer_abs:.0f}円 ＝ {stop_price:.0f}円。原則0.5ATR分だけ余裕を持たせ、単なる日中ノイズではなく『ブレイク失敗』を捉える設計です。"
 
     elif setup.startswith("🎯"):
-        # 75日線押し目：下で待つので買い指値
-        buy_order_type="買い指値"
+        # v19.1 75日線付近まで押した後、「前日高値超え」で反転を確認して入る。
+        # 条件価格は現在値より上に置くトリガーなので、買い指値ではなく買い逆指値。
+        buy_order_type="買い逆指値"
         buy_price=float(r["A買い価格"])
-        buy_price_text=f"{buy_price:.0f}円"
-        buy_condition=f"{buy_price:.0f}円前後への押しを待つ"
+        buy_price_text=f"{buy_price:.0f}円以上"
+        buy_condition=f"75日線付近の押し目形成後、株価が前日高値＋指定ティックの {buy_price:.0f}円以上になったら買い条件発動"
         stop_order_type="売り逆指値"
         stop_price=float(r["A初期損切り"])
-        order_reason="75日線付近の押し目を待って買う。"
-        buy_price_reason=f"75日線押し目セットアップの買い候補 {buy_price:.0f}円を使用しています。75日線付近まで押した後の反転を狙うため『買い指値』です。"
-        stop_price_reason=f"75日線割れの初期損切り参考 {stop_price:.0f}円。75日線と設定済みバッファを基準に算出しています。"
+        order_reason="75日線付近まで押しただけでは買わず、前日高値超えで反転を確認してから入る。"
+        buy_price_reason=f"75日線付近まで押した後の反転確認が目的です。前日高値＋指定ティックで計算した {buy_price:.0f}円を上抜けたらエントリーするため『買い逆指値』です。安く指して待つ価格ではありません。"
+        stop_price_reason=f"買いの前提は『上向き75日線が支持線として機能すること』です。75日線から設定バッファ分下の {stop_price:.0f}円を割ると、その前提が崩れたとみなす初期損切り参考です。ATRを主根拠にはしていません。"
 
     elif setup.startswith("💹"):
         # 決算加速だけでは注文方法を決め打ちしない。
@@ -1518,6 +1525,12 @@ def ai_scores(r):
         "損切り価格表示":stop_price_text,
         "想定初期リスク%":risk_pct,
         "注文理由":order_reason,
+        "売買シナリオ":(
+            "75日線が支持線→前日高値超えで反転確認→75日線の明確割れで撤退" if setup.startswith("🎯") else
+            "直近高値突破→突破水準が支持線化→支持失敗で撤退" if setup.startswith("🔥") else
+            "ブレイク後の押しを待つ→突破水準を維持→支持失敗で撤退" if setup.startswith("🚀") else
+            "明確なエントリーシナリオ待ち"
+        ),
         "注文価格の根拠":buy_price_reason,
         "損切り価格の根拠":stop_price_reason,
         "利確価格の根拠":take_profit_reason,
@@ -1528,7 +1541,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19")
+st.title("🎯 短期上昇株ハンター v19.1")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -1940,7 +1953,7 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
         practical_ranking_explainer()
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,hide_index=True
             )
         st.stop()
@@ -2333,7 +2346,7 @@ if st.session_state.run_scan_v10:
         st.warning("買い逆指値＝上抜け確認、買い指値＝押し待ち、売り逆指値＝約定後の損切り。株価データはリアルタイム保証ではありません。")
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","注文価格の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
