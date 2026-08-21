@@ -12,7 +12,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.4.1",
+    page_title="短期上昇株ハンター v19.4.2",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -873,6 +873,15 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
 
 
 
+
+# ------------------------------------------------------------
+# v19.4.2 表示列の安全化
+# ------------------------------------------------------------
+def safe_columns(df, columns):
+    """表示列が不足していてもKeyErrorでアプリ全体を停止させない。"""
+    return df.reindex(columns=columns)
+
+
 # ------------------------------------------------------------
 # v17.6 実戦ランキングのカラム説明
 # ------------------------------------------------------------
@@ -1069,13 +1078,13 @@ def mode_cache_key(mode_name, selected_markets):
 
 def get_mode_cache(mode_name, selected_markets):
     key = mode_cache_key(mode_name, selected_markets)
-    return st.session_state.get("scan_cache_v194", {}).get(key)
+    return st.session_state.get("scan_cache_v1942", {}).get(key)
 
 def set_mode_cache(mode_name, selected_markets, payload):
-    if "scan_cache_v194" not in st.session_state:
-        st.session_state.scan_cache_v194 = {}
+    if "scan_cache_v1942" not in st.session_state:
+        st.session_state.scan_cache_v1942 = {}
     key = mode_cache_key(mode_name, selected_markets)
-    st.session_state.scan_cache_v194[key] = payload
+    st.session_state.scan_cache_v1942[key] = payload
 
 def cache_age_text(ts):
     if ts is None:
@@ -1637,6 +1646,7 @@ def ai_scores(r):
         "損切り逆指値発動価格表示":stop_trigger_text,
         "発動後売り指値":stop_limit_price,
         "発動後売り指値表示":stop_limit_text,
+        "発動後売り指値の根拠":stop_limit_reason,
         "想定初期リスク%":risk_pct,
         "注文理由":order_reason,
         "売買シナリオ":(
@@ -1655,7 +1665,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.4.1")
+st.title("🎯 短期上昇株ハンター v19.4.2")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -1852,8 +1862,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
-if "scan_cache_v194" not in st.session_state:
-    st.session_state.scan_cache_v194 = {}
+if "scan_cache_v1942" not in st.session_state:
+    st.session_state.scan_cache_v1942 = {}
 if "holdings_v18" not in st.session_state:
     st.session_state.holdings_v18 = []
 if "last_individual_v18" not in st.session_state:
@@ -2024,7 +2034,7 @@ with btn1:
 with btn2:
     if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
         key = mode_cache_key(mode, selected_markets)
-        st.session_state.scan_cache_v194.pop(key, None)
+        st.session_state.scan_cache_v1942.pop(key, None)
         cache_payload = None
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
@@ -2061,14 +2071,14 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
         st.subheader("📊 実戦ランキング")
         st.caption("前回スキャン結果を表示しています。モード切替では再取得しません。")
         st.dataframe(
-            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]],
+            safe_columns(tech.head(100), ["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]),
             use_container_width=True,hide_index=True,
             column_config=practical_ranking_column_config()
         )
         practical_ranking_explainer()
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","発動後買い指値の根拠","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","発動後売り指値の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                safe_columns(tech.head(100), ["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","発動後買い指値の根拠","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","発動後売り指値の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]),
                 use_container_width=True,hide_index=True
             )
         st.stop()
@@ -2452,7 +2462,7 @@ if st.session_state.run_scan_v10:
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
         st.dataframe(
-            tech.head(100)[["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]],
+            safe_columns(tech.head(100), ["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]),
             use_container_width=True,
             hide_index=True,
             column_config=practical_ranking_column_config()
@@ -2461,7 +2471,7 @@ if st.session_state.run_scan_v10:
         st.warning("逆指値は『発動条件』と『発動後の指値』を別々に表示しています。指値付き逆指値は価格が指値を飛び越えると約定しない場合があります。発動後指値の自動許容幅は、約定しやすさと価格悪化のバランスを取るためのヒューリスティック（経験則ベースの計算）で、最適値を保証するものではありません。呼値はアプリ内の簡易計算なので、最終入力時は楽天証券の注文画面でも確認してください。株価データはリアルタイム保証ではありません。")
         with st.expander("🔎 詳細を見る"):
             st.dataframe(
-                tech.head(100)[["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","発動後買い指値の根拠","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","発動後売り指値の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]],
+                safe_columns(tech.head(100), ["順位","銘柄","始値","高値","安値","前日終値","前日比%","上昇力","今の買いやすさ","出来高_20日平均比","75日線","75日線_比較期間前比%","75日線_乖離率%","追加シグナル","セットアップ判定根拠","売買シナリオ","注文条件","注文理由","買い逆指値発動価格表示","発動後買い指値表示","発動後買い指値の根拠","注文価格の根拠","損切り逆指値発動価格表示","発動後売り指値表示","発動後売り指値の根拠","損切り価格の根拠","利確価格の根拠","損切り注文","損切り価格表示","利確目安①表示","利確目安②表示","想定初期リスク%","想定利益%","RR","次回決算日","決算警告","評価コメント"]),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
