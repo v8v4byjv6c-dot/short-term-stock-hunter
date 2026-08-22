@@ -12,7 +12,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.7",
+    page_title="短期上昇株ハンター v20",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -33,14 +33,35 @@ h1,h2,h3 {letter-spacing:-0.02em;}
 # 共通
 # ------------------------------------------------------------
 def tick_size(price):
-    # 簡易呼値。厳密な呼値は銘柄/価格帯で異なるため実注文時に証券会社で確認。
-    if price < 3000: return 1
-    if price < 5000: return 5
-    if price < 10000: return 10
-    if price < 30000: return 10
-    if price < 50000: return 50
-    if price < 100000: return 100
-    return 100
+    """
+    注文価格丸め用の安全側呼値。
+    JPX「その他の銘柄」テーブル相当の刻みを使用。
+    TOPIX500は実際にはより細かい呼値が使える場合があるが、
+    この刻みはその倍数なので注文価格としては有効な保守的刻み。
+    """
+    if price <= 3000: return 1
+    if price <= 5000: return 5
+    if price <= 30000: return 10
+    if price <= 50000: return 50
+    if price <= 300000: return 100
+    if price <= 500000: return 500
+    if price <= 3000000: return 1000
+    if price <= 5000000: return 5000
+    if price <= 30000000: return 10000
+    if price <= 50000000: return 50000
+    return 100000
+
+
+def round_order_price(price, side="nearest"):
+    """呼値単位へ丸める。buy_up=切上げ、sell_down=切下げ。"""
+    if not np.isfinite(price) or price<=0:
+        return np.nan
+    t=tick_size(price)
+    if side=="buy_up":
+        return math.ceil(price/t)*t
+    if side=="sell_down":
+        return math.floor(price/t)*t
+    return round(price/t)*t
 
 def adaptive_limit_buffer(price, atr_yen):
     """逆指値発動後の指値許容幅。固定ティックではなく値動きに合わせて自動計算。"""
@@ -344,7 +365,7 @@ def download_batch(tickers, period):
             period=period,
             interval="1d",
             group_by="ticker",
-            auto_adjust=False,
+            auto_adjust=True,
             repair=False,
             progress=False,
             threads=True,
@@ -371,119 +392,107 @@ def download_batch(tickers, period):
         pass
     return out
 
-@st.cache_data(ttl=300, show_spinner=False)
-def download_latest_session(tickers):
-    """
-    v19.7:
-    日足が1営業日遅れるケースへの対策。
-    60分足をまとめて取得し、銘柄ごとに最新セッションのOHLCVへ集約する。
-    日足履歴は移動平均等の長期計算用、最新セッションは当日OHLCV補完用として分離する。
-    """
-    tickers=list(dict.fromkeys(tickers))
-    result={}
-    if not tickers:
-        return result
+def _normalise_daily_frame(d):
+    """yfinance日足を単一銘柄の標準OHLCVへ正規化。"""
+    if d is None or d.empty:
+        return None
+    q=d.copy()
+    if isinstance(q.columns,pd.MultiIndex):
+        q.columns=q.columns.get_level_values(0)
+    need=["Open","High","Low","Close","Volume"]
+    if not all(c in q.columns for c in need):
+        return None
+    q=q[need].copy()
+    q.index=pd.to_datetime(q.index)
     try:
-        x=yf.download(
-            tickers, period="5d", interval="60m",
-            group_by="ticker", auto_adjust=False, repair=False,
-            prepost=False, progress=False, threads=True, timeout=15
-        )
-        if x is None or x.empty:
-            return result
-
-        def aggregate_one(df):
-            if df is None or df.empty:
-                return None
-            need=[z for z in ["Open","High","Low","Close","Volume"] if z in df.columns]
-            if len(need)<5:
-                return None
-            q=df[need].dropna(subset=["Close"]).copy()
-            if q.empty:
-                return None
-            ix=pd.to_datetime(q.index)
-            try:
-                if ix.tz is not None:
-                    ix=ix.tz_convert("Asia/Tokyo").tz_localize(None)
-            except Exception:
-                try: ix=ix.tz_localize(None)
-                except Exception: pass
-            q.index=ix
-            session_date=q.index[-1].date()
-            day=q[q.index.date==session_date]
-            if day.empty:
-                return None
-            return {
-                "date":session_date,
-                "Open":float(day.Open.dropna().iloc[0]),
-                "High":float(day.High.max()),
-                "Low":float(day.Low.min()),
-                "Close":float(day.Close.dropna().iloc[-1]),
-                "Volume":float(day.Volume.fillna(0).sum()),
-            }
-
-        if len(tickers)==1 and not isinstance(x.columns,pd.MultiIndex):
-            a=aggregate_one(x)
-            if a: result[tickers[0]]=a
-        elif isinstance(x.columns,pd.MultiIndex):
-            l0=set(x.columns.get_level_values(0)); l1=set(x.columns.get_level_values(1))
-            if any(t in l0 for t in tickers):
-                for t in tickers:
-                    if t in l0:
-                        a=aggregate_one(x[t])
-                        if a: result[t]=a
-            else:
-                for t in tickers:
-                    if t in l1:
-                        a=aggregate_one(x.xs(t,axis=1,level=1))
-                        if a: result[t]=a
+        if q.index.tz is not None:
+            q.index=q.index.tz_localize(None)
     except Exception:
         pass
-    return result
+    q=q[~q.index.duplicated(keep="last")].sort_index()
+    q=q.dropna(subset=["Close"])
+    return q if not q.empty else None
 
 
-def merge_latest_session(data, latest):
-    """最新60分足から作った日次OHLCVを日足履歴へ上書き/追加する。"""
-    merged=dict(data)
-    for t,a in latest.items():
-        d=merged.get(t)
-        if d is None or d.empty:
-            continue
-        q=d.copy()
-        if isinstance(q.columns,pd.MultiIndex):
-            q.columns=q.columns.get_level_values(0)
-        q.index=pd.to_datetime(q.index)
-        try:
-            if q.index.tz is not None: q.index=q.index.tz_localize(None)
-        except Exception: pass
-        dt=pd.Timestamp(a["date"])
-        for col in ["Open","High","Low","Close","Volume"]:
-            if col not in q.columns: q[col]=np.nan
-        q.loc[dt,["Open","High","Low","Close","Volume"]]=[
-            a["Open"],a["High"],a["Low"],a["Close"],a["Volume"]
-        ]
-        q=q.sort_index()
-        q=q[~q.index.duplicated(keep="last")]
-        merged[t]=q
-    return merged
+def validate_daily_frame(d, expected_date=None):
+    """
+    ランキング投入前のOHLCV品質チェック。
+    latest-sessionの日付・四本値整合・出来高・前日終値の有無を検証。
+    """
+    q=_normalise_daily_frame(d)
+    if q is None or len(q)<2:
+        return False,"日足不足",None
+
+    last_date=pd.Timestamp(q.index[-1]).date()
+    if expected_date is not None and last_date != expected_date:
+        return False,f"日付不一致({last_date})",last_date
+
+    x=q.iloc[-1]
+    vals=[x.Open,x.High,x.Low,x.Close,x.Volume]
+    try:
+        vals=[float(v) for v in vals]
+    except Exception:
+        return False,"OHLCV数値不正",last_date
+
+    o,h,l,cl,v=vals
+    if not all(np.isfinite(z) for z in vals):
+        return False,"OHLCV欠損",last_date
+    if min(o,h,l,cl) <= 0 or v < 0:
+        return False,"OHLCV範囲不正",last_date
+    if l > min(o,cl) or h < max(o,cl) or h < l:
+        return False,"四本値整合エラー",last_date
+    try:
+        pc=float(q.Close.iloc[-2])
+        if not np.isfinite(pc) or pc<=0:
+            return False,"前日終値不正",last_date
+    except Exception:
+        return False,"前日終値不足",last_date
+    return True,"OK",last_date
 
 
-def latest_session_consensus(latest):
-    """最新セッション日を多数決で決める。指数日足そのものを基準日にしない。"""
-    if not latest:
+@st.cache_data(ttl=300, show_spinner=False)
+def expected_latest_jpx_session():
+    """
+    日本取引所の取引カレンダーから「直近の終了済み営業日」を返す。
+    営業中は前営業日を返すため、未確定の日足をランキングに混ぜない。
+    """
+    try:
+        import exchange_calendars as xcals
+        now=pd.Timestamp.now(tz="Asia/Tokyo")
+        cal=xcals.get_calendar("JPX")
+        start=(now-pd.Timedelta(days=14)).date()
+        end=now.date()
+        sessions=cal.sessions_in_range(start,end)
+        for s in reversed(sessions):
+            close_ts=cal.session_close(s).tz_convert("Asia/Tokyo")
+            if now >= close_ts:
+                return pd.Timestamp(s).date()
         return None
-    dates=pd.Series([v["date"] for v in latest.values()])
-    if dates.empty:
+    except Exception:
         return None
-    return dates.value_counts().index[0]
+
+
+def audit_daily_dataset(data, tickers, expected_date):
+    """
+    全対象の日足を監査し、最新営業日かつOHLCV整合が取れた銘柄だけ返す。
+    古い値を最新値としてフォールバックすることは禁止。
+    """
+    good={}
+    issues=[]
+    for t in tickers:
+        d=data.get(t)
+        ok,reason,last_date=validate_daily_frame(d,expected_date)
+        if ok:
+            good[t]=_normalise_daily_frame(d)
+        else:
+            issues.append({"ticker":t,"理由":reason,"取得最終日":last_date})
+    return good,pd.DataFrame(issues)
 
 @st.cache_data(ttl=120, show_spinner=False)
 def latest_jp_market_date():
-    try:
-        d=yf.download("^N225",period="10d",interval="1d",auto_adjust=False,repair=False,progress=False,threads=False,timeout=8)
-        if d is None or d.empty: return None
-        return pd.Timestamp(d.index[-1]).tz_localize(None).date()
-    except Exception: return None
+    # 後方互換用。v20では指数データではなくJPX取引カレンダーを正とする。
+    return expected_latest_jpx_session()
+
 
 def _frame_last_date(d):
     try: return pd.Timestamp(d.dropna(how="all").index[-1]).tz_localize(None).date()
@@ -577,8 +586,8 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     As = min(100,max(0,.65*dist+.35*sl)) if A else 0
 
     # 75日線付近に来ただけでは買わず、前日高値超えで反転確認。
-    a_buy = float(p.High) + tick_size(float(p.High))*buy_ticks
-    a_stop = ma75*(1-a_stop_buffer_pct/100)
+    a_buy = round_order_price(float(p.High) + tick_size(float(p.High))*buy_ticks, "buy_up")
+    a_stop = round_order_price(ma75*(1-a_stop_buffer_pct/100), "sell_down")
 
     B = bool(trend and np.isfinite(bh) and close > bh and vr >= 1.3)
     # ブレイク水準から上がりすぎている場合は「追いかけ買い」リスクとして減点。
@@ -623,7 +632,7 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
     # v19.1 Bの損切りは「ブレイク水準を支持線として維持できるか」を主根拠にする。
     # ATRは損切り理由そのものではなく、日々のノイズで刈られにくくする補助バッファ。
     b_stop_buffer = 0.5 * atr14 if np.isfinite(atr14) else (bh * 0.015 if np.isfinite(bh) else np.nan)
-    b_stop = (bh - b_stop_buffer) if np.isfinite(bh) and np.isfinite(b_stop_buffer) else np.nan
+    b_stop = round_order_price(bh - b_stop_buffer, "sell_down") if np.isfinite(bh) and np.isfinite(b_stop_buffer) else np.nan
 
     return {
         "データ最終日":data_last_date,
@@ -650,7 +659,7 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
 
 
 # ------------------------------------------------------------
-# v19.7 銘柄診断・データ鮮度
+# v20 銘柄診断・データ品質
 # ------------------------------------------------------------
 def business_day_age(last_date):
     """今日までの平日ベースの概算経過日数。祝日は考慮しないため警告用の目安。"""
@@ -679,8 +688,8 @@ def fetch_ticker_diagnostic_data(ticker, period="1y"):
     try:
         d = yf.download(
             ticker, period=period, interval="1d",
-            auto_adjust=False, repair=True,
-            progress=False, threads=False
+            auto_adjust=True, repair=False,
+            progress=False, threads=False, timeout=12
         )
         if d is None or d.empty:
             return None
@@ -718,6 +727,17 @@ def diagnose_ai_ticker(ticker, universe, tech, slope_days, max_dev, breakout_day
             "個別再取得": False, "現在順位": rank,
             "表示されない主因": "株価日足を個別再取得できませんでした。",
         }
+
+    expected_date=expected_latest_jpx_session()
+    ok,quality_reason,last_date=validate_daily_frame(d,expected_date)
+    if not ok:
+        return {
+            "銘柄": name, "ticker": ticker, "市場対象": universe_hit,
+            "個別再取得": True, "現在順位": rank,
+            "データ最終日": last_date, "データ鮮度警告": True,
+            "表示されない主因": f"個別再取得データが品質ゲート不合格：{quality_reason}。期待基準日={expected_date}",
+        }
+    d=_normalise_daily_frame(d)
 
     m = technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy_ticks)
     if not m:
@@ -1083,7 +1103,7 @@ def choruko_metrics(d):
         reversal=(close>float(cur.Open)) or (close>float(prev.High))
 
         return {
-            "株価":close,"現在値":close,"前日終値":prev_close,"前日比%":day_pct,
+            "株価":close,"基準終値":close,"前日終値":prev_close,"前日比%":day_pct,
             "25日線":ma25,"25日線乖離%":dev25,"BBσ":bbz,"RCI9":rci,
             "急落-2.5%":bool(s1),"25日線割れ":bool(s2),"BB-3σ":bool(s3),"RCI-90":bool(s4),
             "底打ち条件数":count,"反転確認_独自":bool(reversal),"急落前水準":prev_close,
@@ -1105,7 +1125,7 @@ def choruko_judgment(r, material_status):
     return "⚪ 対象外寄り",f"{n}/4条件のみ。"
 
 def choruko_exit_plan(r):
-    close=float(r["現在値"])
+    close=float(r["基準終値"])
     ma25=float(r["25日線"]) if np.isfinite(r.get("25日線",np.nan)) else np.nan
     prev=float(r["急落前水準"]) if np.isfinite(r.get("急落前水準",np.nan)) else np.nan
     candidates=[]
@@ -1127,7 +1147,7 @@ def choruko_exit_plan(r):
 def holding_management_analysis(r, buy_price=None, shares=None):
     """
     保有者目線のルールベース診断。
-    新規買い評価とは分け、買値・現在値・移動平均・ATRから
+    新規買い評価とは分け、買値・基準終値・移動平均・ATRから
     保有継続/注意/利確検討/トレンド崩れを整理する。
     """
     current=float(r["株価"])
@@ -1155,7 +1175,7 @@ def holding_management_analysis(r, buy_price=None, shares=None):
         trend_stop = ma75 - 0.5*atr
         stop_basis = "75日線 - 0.5ATR"
 
-    # 現在値より上になることは避ける。
+    # 基準終値より上になることは避ける。
     manage_stop=min(trend_stop, current-tick_size(current))
     if np.isfinite(bp):
         # 含み益がある場合は、買値から極端に遠い損切りになりすぎないよう
@@ -1164,9 +1184,11 @@ def holding_management_analysis(r, buy_price=None, shares=None):
         manage_stop=max(manage_stop, entry_risk_stop)
         manage_stop=min(manage_stop, current-tick_size(current))
 
-    # 次の利確参考は現在値からATR基準。予測ではなく管理目安。
-    take1=current+1.5*atr
-    take2=current+3.0*atr
+    manage_stop=round_order_price(manage_stop,"sell_down")
+
+    # 次の利確参考は基準終値からATR基準。予測ではなく管理目安。
+    take1=round_order_price(current+1.5*atr,"buy_up")
+    take2=round_order_price(current+3.0*atr,"buy_up")
 
     if current <= ma75 and slope < 0:
         holding_grade="🔴 トレンド崩れ"
@@ -1214,6 +1236,16 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
         st.error("株価データを取得できませんでした。")
         return None
 
+    expected_date=expected_latest_jpx_session()
+    ok,reason,last_date=validate_daily_frame(d,expected_date)
+    if not ok:
+        st.error(
+            f"🚨 個別分析を停止しました。最新確定日足の品質チェックに失敗しています：{reason}。"
+            f" 期待基準日={expected_date} / 取得最終日={last_date}"
+        )
+        return None
+    d=_normalise_daily_frame(d)
+
     r=technical_scan(d,20,3.0,60,0.35,2)
     if not r:
         st.error("分析に必要な株価データが不足しています。")
@@ -1240,8 +1272,9 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
     earnings=get_earnings_date_info(ticker)
 
     st.subheader(f"🔎 {r['銘柄']}｜個別分析")
+    st.caption(f"📅 個別分析基準日：{r.get('データ最終日')} ｜ 確定日足のみ使用。基準日不一致なら分析を停止します。")
     c1,c2,c3,c4=st.columns(4)
-    c1.metric("現在値",f"{r['株価']:.0f}円",f"{r['前日比']:+.0f}円 / {r['前日比%']:+.2f}%")
+    c1.metric("基準終値",f"{r['株価']:.0f}円",f"{r['前日比']:+.0f}円 / {r['前日比%']:+.2f}%")
     if buy_price and float(buy_price)>0:
         c2.metric("取得単価",f"{float(buy_price):.0f}円",f"{h['含み損益%']:+.2f}%")
     else:
@@ -1298,7 +1331,7 @@ def render_single_holding_analysis(all_u, code_value, buy_price=0.0, shares=0):
 
     with st.expander("📊 テクニカル詳細"):
         detail=pd.DataFrame([{
-            "現在値":r["株価"],
+            "基準終値":r["株価"],
             "25日線":r["25日線"],
             "75日線":r["75日線"],
             "75日線傾き%":r["75日線_比較期間前比%"],
@@ -1350,7 +1383,7 @@ def practical_ranking_column_config():
             display_text="Yahoo! ↗"
         ),
         "株価": st.column_config.NumberColumn(
-            "現在値",
+            "基準終値",
             help="取得できた最新の日足終値です。リアルタイム株価を保証する値ではありません。",
             format="%.0f円"
         ),
@@ -1361,7 +1394,7 @@ def practical_ranking_column_config():
         ),
         "前日比%": st.column_config.NumberColumn(
             "前日比%",
-            help="前日終値に対する現在値の騰落率です。例：+2.00%なら前日終値から約2%上昇しています。短期の勢いを見る基本情報です。",
+            help="前日終値に対する基準終値の騰落率です。例：+2.00%なら前日終値から約2%上昇しています。短期の勢いを見る基本情報です。",
             format="%+.2f%%"
         ),
         "短期総合スコア": st.column_config.ProgressColumn(
@@ -1446,7 +1479,7 @@ def practical_ranking_explainer():
 - **順位**：現在の独自短期ランキング順位。上昇確率ではありません。
 - **実戦優先度**：今すぐ注文候補か、条件待ち・押し待ち・見送りかを整理した表示。
 - **銘柄 / チャート**：銘柄コード・名称とYahoo!チャートへのリンク。
-- **現在値**：取得できた最新の日足終値。リアルタイム保証ではありません。
+- **基準終値**：取得できた最新の日足終値。リアルタイム保証ではありません。
 - **前日比 / 前日比%**：1営業日前の終値から、今日どれだけ動いたか。
 - **短期スコア**：トレンド・出来高・モメンタム・業績・買い位置・過熱リスクなどを統合した独自スコア。**勝率ではありません**。
 - **セットアップ**：ブレイク準備、ブレイク直後、75日線押し目など、現在のチャートの型。
@@ -1462,7 +1495,7 @@ def practical_ranking_explainer():
 - **損切り｜発動条件**：保有後「何円以下になったら損切り注文を発動するか」。
 - **損切り｜発動後の売り指値**：発動後に実際に出す売り指値。許容幅は同じルールで自動計算。
 - **注文価格**：従来の要約表示。v19.4では上記4列を実注文向けの主表示にします。
-- **注文価格の根拠**：ブレイク準備は「ブレイク水準＋1ティック」の買い逆指値。ブレイク直後は高値を追わず「現在値から0.75ATR程度の押し」を買い指値。75日線押し目は「前日高値＋指定ティック」を上抜けて反転確認する買い逆指値。
+- **注文価格の根拠**：ブレイク準備は「ブレイク水準＋呼値1単位」の買い逆指値。ブレイク直後は高値を追わず「基準終値から0.75ATR程度の押し」を買い指値。75日線押し目は「前日高値＋指定ティック」を上抜けて反転確認する買い逆指値。
 - **損切り**：約定後の売り逆指値の参考値。
 - **損切り価格の根拠**：まず「買った理由が崩れる水準」を決めます。75日線押し目なら75日線の明確割れ、ブレイク系ならブレイク水準の支持失敗。ATRはブレイク系で日々のノイズを避ける補助バッファとしてのみ使用します。
 - **利確①**：基本的に損切り幅の2倍（2R）を狙う第一利確参考値。
@@ -1471,7 +1504,7 @@ def practical_ranking_explainer():
 #### 📝 用語をかんたんに
 - **ブレイク**：これまで超えられなかった高値を上に抜けること。
 - **ブレイク水準**：その「これまで超えられなかった高値」。
-- **1ティック**：株価が動く最小単位。ここでは「高値に到達しただけ」でなく「高値を超えた」と確認するために使います。
+- **呼値1単位**：株価が動く最小単位。ここでは「高値に到達しただけ」でなく「高値を超えた」と確認するために使います。
 - **買い逆指値**：株価が指定価格**以上**になったら買い注文を発動する方法。上昇を確認してから買う用途。
 - **買い指値**：指定価格**以下**まで下がったら買う方法。安くなるのを待つ用途。
 - **支持線**：株価が下がってきたときに、下げ止まりを期待する価格帯。
@@ -1521,13 +1554,13 @@ def mode_cache_key(mode_name, selected_markets):
 
 def get_mode_cache(mode_name, selected_markets):
     key = mode_cache_key(mode_name, selected_markets)
-    return st.session_state.get("scan_cache_v197", {}).get(key)
+    return st.session_state.get("scan_cache_v20", {}).get(key)
 
 def set_mode_cache(mode_name, selected_markets, payload):
-    if "scan_cache_v197" not in st.session_state:
-        st.session_state.scan_cache_v197 = {}
+    if "scan_cache_v20" not in st.session_state:
+        st.session_state.scan_cache_v20 = {}
     key = mode_cache_key(mode_name, selected_markets)
-    st.session_state.scan_cache_v197[key] = payload
+    st.session_state.scan_cache_v20[key] = payload
 
 def cache_age_text(ts):
     if ts is None:
@@ -1575,7 +1608,11 @@ def get_market_regime():
             d = yf.download(ticker, period="6mo", auto_adjust=True, progress=False, threads=False)
             if d is None or d.empty or len(d) < 80:
                 continue
-            close = d["Close"]
+            expected_date=expected_latest_jpx_session()
+            q=_normalise_daily_frame(d)
+            if q is None or pd.Timestamp(q.index[-1]).date()!=expected_date:
+                continue
+            close = q["Close"]
             if isinstance(close, pd.DataFrame):
                 close = close.iloc[:, 0]
             close = close.dropna()
@@ -1590,7 +1627,7 @@ def get_market_regime():
             score += 30 if m20 > m75 else 0
             score += 25 if slope75 > 0 else 0
             score += 10 if float(close.iloc[-1] / close.iloc[-6] - 1) > 0 else 0
-            out.append({"指数":name, "現在値":now, "20日線":m20, "75日線":m75, "75日線傾き%":slope75, "地合い点":score})
+            out.append({"指数":name, "基準終値":now, "20日線":m20, "75日線":m75, "75日線傾き%":slope75, "地合い点":score})
         except Exception:
             pass
 
@@ -1849,13 +1886,13 @@ def ai_scores(r):
         trigger=float(r["A買い価格"])
         stop=float(r["A初期損切り"])
     elif np.isfinite(r["Bブレイク水準"]):
-        trigger=float(r["Bブレイク水準"])+tick_size(float(r["Bブレイク水準"]))
+        trigger=round_order_price(float(r["Bブレイク水準"])+tick_size(float(r["Bブレイク水準"])),"buy_up")
         if np.isfinite(r["B初期損切り"]):
             stop=float(r["B初期損切り"])
         else:
             stop=trigger-(float(r["ATR14%"])/100*float(r["株価"]) if np.isfinite(r["ATR14%"]) else trigger*.03)
     else:
-        trigger=float(r["株価"])+tick_size(float(r["株価"]))
+        trigger=round_order_price(float(r["株価"])+tick_size(float(r["株価"])),"buy_up")
         stop=trigger-(float(r["ATR14%"])/100*float(r["株価"]) if np.isfinite(r["ATR14%"]) else trigger*.03)
 
     if total>=80 and ease>=75:
@@ -1903,7 +1940,7 @@ def ai_scores(r):
     stop_limit_reason="—"
 
     if chase:
-        order_reason="過熱または買いやすさ不足。現在値を追いかけず、押し目形成後に再判定。"
+        order_reason="過熱または買いやすさ不足。基準終値を追いかけず、押し目形成後に再判定。"
         buy_price_reason="注文を出さないため買い価格は設定しません。75日線乖離・ブレイク後上昇率・買いやすさのいずれかが過熱側です。"
         stop_price_reason="未約定のため損切り価格は設定しません。"
 
@@ -1913,7 +1950,7 @@ def ai_scores(r):
         buy_price=float(trigger)
         buy_trigger_price=buy_price
         buy_limit_buffer=adaptive_limit_buffer(buy_trigger_price, atr_yen)
-        buy_limit_price=buy_trigger_price + buy_limit_buffer
+        buy_limit_price=round_order_price(buy_trigger_price + buy_limit_buffer,"buy_up")
         buy_trigger_text=f"{buy_trigger_price:.0f}円以上"
         buy_limit_text=f"{buy_limit_price:.0f}円"
         buy_price_text=f"発動 {buy_trigger_text} → 指値 {buy_limit_text}"
@@ -1921,7 +1958,7 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="まだブレイク前。上抜けを確認してから入る。"
-        buy_price_reason=f"直近高値（過去{breakout_days}営業日で超えられなかった高値）{float(r['Bブレイク水準']):.0f}円より、最小の値幅1つ分だけ上の {buy_price:.0f}円を条件価格にしています。つまり『{buy_price:.0f}円以上になったら買いを検討』です。安く買うための価格ではなく、直近高値を実際に突破して上昇の強さを確認するための価格です。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。発動後の指値は固定ティックではなく自動計算し、{buy_trigger_price:.0f}円＋許容幅{buy_limit_buffer:.0f}円＝{buy_limit_price:.0f}円です。許容幅は現行方式としてATRの15%を基本に、発動価格の0.30%を上限、最低2ティックとしています。これは最適値ではなく、v19.5の過去検証で比較対象にしています。"
+        buy_price_reason=f"直近高値（過去{breakout_days}営業日で超えられなかった高値）{float(r['Bブレイク水準']):.0f}円より、注文価格丸め用の呼値1つ分だけ上の {buy_price:.0f}円を条件価格にしています。つまり『{buy_price:.0f}円以上になったら買いを検討』です。安く買うための価格ではなく、直近高値を実際に突破して上昇の強さを確認するための価格です。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。発動後の指値は固定ティックではなく自動計算し、{buy_trigger_price:.0f}円＋許容幅{buy_limit_buffer:.0f}円＝{buy_limit_price:.0f}円です。許容幅は現行方式としてATRの15%を基本に、発動価格の0.30%を上限、最低2ティックとしています。これは最適値ではなく、v19.5の過去検証で比較対象にしています。"
         blevel=float(r["Bブレイク水準"])
         atr_abs=float(r["ATR14"]) if np.isfinite(r["ATR14"]) else np.nan
         buffer_abs=(blevel-stop_price)
@@ -1944,18 +1981,18 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(stop)
         order_reason="ブレイク済み。新規の買い逆指値ではなく、押しを待つ指値買い。"
-        buy_price_reason=f"すでに直近高値 {breakout:.0f}円を突破済みなので、上がった価格を追いかけません。現在値 {current:.0f}円から少し下がるのを待ちます。下げ幅の目安は0.75ATR（ATR＝その銘柄が普段1日にどれくらい動くかの目安の75%）です。ただし、突破した {breakout:.0f}円より下では買わない範囲として {buy_price_text} を買い指値（指定した価格以下で買う注文）の候補にしています。"
+        buy_price_reason=f"すでに直近高値 {breakout:.0f}円を突破済みなので、上がった価格を追いかけません。基準終値 {current:.0f}円から少し下がるのを待ちます。下げ幅の目安は0.75ATR（ATR＝その銘柄が普段1日にどれくらい動くかの目安の75%）です。ただし、突破した {breakout:.0f}円より下では買わない範囲として {buy_price_text} を買い指値（指定した価格以下で買う注文）の候補にしています。"
         buffer_abs=(breakout-stop_price)
         stop_price_reason=f"突破した直近高値 {breakout:.0f}円付近が、その後は下値を支える価格（支持線）になることを期待しています。損切り参考は {breakout:.0f}円 － 値動きの余裕幅 {buffer_abs:.0f}円 ＝ {stop_price:.0f}円です。余裕幅は原則0.5ATR（普段の1日の値動き幅の目安の半分）。少し割れただけではなく、突破が失敗した可能性が高まったところで撤退する考え方です。"
 
     elif setup.startswith("🎯"):
         # v19.1 75日線付近まで押した後、「前日高値超え」で反転を確認して入る。
-        # 条件価格は現在値より上に置くトリガーなので、買い指値ではなく買い逆指値。
+        # 条件価格は基準終値より上に置くトリガーなので、買い指値ではなく買い逆指値。
         buy_order_type="買い逆指値"
         buy_price=float(r["A買い価格"])
         buy_trigger_price=buy_price
         buy_limit_buffer=adaptive_limit_buffer(buy_trigger_price, atr_yen)
-        buy_limit_price=buy_trigger_price + buy_limit_buffer
+        buy_limit_price=round_order_price(buy_trigger_price + buy_limit_buffer,"buy_up")
         buy_trigger_text=f"{buy_trigger_price:.0f}円以上"
         buy_limit_text=f"{buy_limit_price:.0f}円"
         buy_price_text=f"発動 {buy_trigger_text} → 指値 {buy_limit_text}"
@@ -1963,7 +2000,7 @@ def ai_scores(r):
         stop_order_type="売り逆指値"
         stop_price=float(r["A初期損切り"])
         order_reason="75日線付近まで押しただけでは買わず、前日高値超えで反転を確認してから入る。"
-        buy_price_reason=f"75日移動平均線（過去75営業日の平均株価）付近まで下がった後、本当に上向きへ戻り始めたかを確認してから買う考え方です。前日の高値より最小の値幅分だけ上の {buy_price:.0f}円を超えたら買いを検討します。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。発動後の指値は{buy_trigger_price:.0f}円＋自動許容幅{buy_limit_buffer:.0f}円＝{buy_limit_price:.0f}円です。許容幅は現行方式としてATRの15%を基本に、発動価格の0.30%を上限、最低2ティックとしています。これは最適値ではなく、v19.5の過去検証で比較対象にしています。安い価格で待つ『買い指値』ではありません。"
+        buy_price_reason=f"75日移動平均線（過去75営業日の平均株価）付近まで下がった後、本当に上向きへ戻り始めたかを確認してから買う考え方です。前日の高値より注文価格丸め用の呼値分だけ上の {buy_price:.0f}円を超えたら買いを検討します。注文種類は買い逆指値（株価が指定価格以上になったら買い注文を発動）です。発動後の指値は{buy_trigger_price:.0f}円＋自動許容幅{buy_limit_buffer:.0f}円＝{buy_limit_price:.0f}円です。許容幅は現行方式としてATRの15%を基本に、発動価格の0.30%を上限、最低2ティックとしています。これは最適値ではなく、v19.5の過去検証で比較対象にしています。安い価格で待つ『買い指値』ではありません。"
         stop_price_reason=f"買った理由は『上向きの75日移動平均線（過去75営業日の平均株価）が下値を支える』と考えたためです。その75日線から設定した余裕幅だけ下の {stop_price:.0f}円を割ったら、買った前提が崩れたと判断する損切り参考です。このセットアップではATRを損切りの主な理由にはしていません。"
 
     elif setup.startswith("💹"):
@@ -2001,7 +2038,7 @@ def ai_scores(r):
     if stop_order_type=="売り逆指値" and np.isfinite(stop_price):
         stop_trigger_price=float(stop_price)
         stop_limit_buffer=adaptive_limit_buffer(stop_trigger_price, atr_yen)
-        stop_limit_price=stop_trigger_price - stop_limit_buffer
+        stop_limit_price=round_order_price(stop_trigger_price - stop_limit_buffer,"sell_down")
         stop_trigger_text=f"{stop_trigger_price:.0f}円以下"
         stop_limit_text=f"{stop_limit_price:.0f}円"
     else:
@@ -2108,19 +2145,33 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.7")
+st.title("🎯 短期上昇株ハンター v20")
+st.info("🛡️ v20 データ品質優先：最新営業日の確定日足が揃わない場合はランキングを停止します。60分足から終値を推定しません。注文参考価格も同じ基準日データから再計算します。")
+
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
     "分析モード",
-    ["📘 本ベース A/B/C/D", "🧪 独自短期・独自統合スクリーナー", "🏦 長期・年初来安値", "📕 ちょる子式｜大型株逆張り", "🔎 保有銘柄・個別分析"],
+    ["📘 『世界一やさしい 株の教科書 1年生』 A/B/C/D", "🧪 独自短期・独自統合スクリーナー", "🏦 長期・年初来安値", "📕 ちょる子式｜大型株逆張り", "🔎 保有銘柄・個別分析"],
     horizontal=True,
     help="ランキング3モードに加えて、買った銘柄を保有者目線で個別分析・管理できます。"
 )
 
+with st.expander("🛡️ v20で監査・修正した重要項目"):
+    st.markdown("""
+- **株価データ**：60分足を日足へ合成する処理を廃止。直近終了済みJPX営業日の**確定日足**だけ使用。
+- **古いデータ**：日付が基準日と違う銘柄は除外。母集団の95%未満しか揃わない場合、短期ランキング自体を停止。
+- **OHLCV整合**：始値・高値・安値・終値・出来高の欠損/矛盾をランキング前に検査。
+- **表示名**：「現在値」ではなく**基準終値**。リアルタイム株価と誤認させない。
+- **注文価格**：買いは切上げ、損切りは切下げで呼値単位に丸める。
+- **呼値**：JPXの「その他銘柄」相当の保守的な刻みを使用。TOPIX500では実際にもっと細かい注文が可能な場合があります。
+- **ATRバッファ**：0.15ATR等は経験則であり最適性未保証。過去検証は参考情報で、注文根拠の主役にはしません。
+- **RR**：利確①を2Rで置いているため、表示RR=2.0は予測値ではなく**設定値**です。
+""")
+
 with st.expander("ℹ️ 5つのモードの違い"):
     st.markdown("""
-**📘 本ベース A/B/C/D**  
+**📘 『世界一やさしい 株の教科書 1年生』 A/B/C/D**  
 これまで育ててきたロジックです。Aは参考書の「75日線が上向き・株価は75日線より下・75日線上抜けで買う」を中心にしています。B/C/Dは補助戦略です。
 
 **🧪 独自短期・独自統合スクリーナー**  
@@ -2277,7 +2328,7 @@ with st.sidebar:
         long_max_low_dist = st.slider(
             "年初来安値から何%以内を重点表示するか",
             1, 30, 10, 1,
-            help="何を変える？：現在値が年初来安値から何％以内なら『安値に近い』候補として重点表示するかです。小さくすると年初来安値ギリギリの銘柄に厳しく絞り、大きくすると候補範囲を広げます。例：10%なら年初来安値から10%以内です。"
+            help="何を変える？：基準終値が年初来安値から何％以内なら『安値に近い』候補として重点表示するかです。小さくすると年初来安値ギリギリの銘柄に厳しく絞り、大きくすると候補範囲を広げます。例：10%なら年初来安値から10%以内です。"
         )
 
     elif mode.startswith("📕"):
@@ -2306,8 +2357,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
-if "scan_cache_v197" not in st.session_state:
-    st.session_state.scan_cache_v197 = {}
+if "scan_cache_v20" not in st.session_state:
+    st.session_state.scan_cache_v20 = {}
 if "holdings_v18" not in st.session_state:
     st.session_state.holdings_v18 = []
 if "last_individual_v18" not in st.session_state:
@@ -2448,7 +2499,7 @@ with st.expander("📐 市場トレンド判定の仕組み"):
     st.markdown("""
 **TOPIXと日経平均をそれぞれ100点満点で採点し、2指数の平均を表示します。**
 
-- 現在値 ＞ 20日移動平均線：**+35点**
+- 基準終値 ＞ 20日移動平均線：**+35点**
 - 20日移動平均線 ＞ 75日移動平均線：**+30点**
 - 75日移動平均線が10営業日前より上昇：**+25点**
 - 直近5営業日の騰落率がプラス：**+10点**
@@ -2475,14 +2526,13 @@ btn1, btn2 = st.columns([4,1])
 with btn1:
     if st.button(f"🚀 {market_label}をスキャン", type="primary", use_container_width=True, disabled=not selected_markets):
         download_batch.clear()
-        download_latest_session.clear()
         latest_jp_market_date.clear()
         fetch_ticker_diagnostic_data.clear()
         st.session_state.run_scan_v10=True
 with btn2:
     if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
         key = mode_cache_key(mode, selected_markets)
-        st.session_state.scan_cache_v197.pop(key, None)
+        st.session_state.scan_cache_v20.pop(key, None)
         cache_payload = None
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
@@ -2540,7 +2590,7 @@ if not st.session_state.run_scan_v10 and cache_payload is not None:
             use_container_width=True,hide_index=True,
             column_config={
                 "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
-                "株価":st.column_config.NumberColumn("現在値",format="%.0f円"),
+                "株価":st.column_config.NumberColumn("基準終値",format="%.0f円"),
                 "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
                 "年初来安値":st.column_config.NumberColumn("年初来安値",format="%.0f円"),
                 "年初来安値から%":st.column_config.NumberColumn("安値から",format="%+.2f%%"),
@@ -2561,35 +2611,41 @@ if st.session_state.run_scan_v10:
     st.caption("⚡ v19.7：全銘柄の個別再取得を廃止。一括取得＋鮮度監査で高速化しています。")
     data=download_batch(universe.ticker.tolist(),period)
 
-    # v19.7: 日足の更新待ちに依存せず、最新60分足を最新営業日のOHLCVへ集約して補完
-    status.info(f"①-2 {market_label}の最新営業日OHLCVを確認しています…")
-    latest_session=download_latest_session(universe.ticker.tolist())
-    market_data_date=latest_session_consensus(latest_session)
-    data=merge_latest_session(data,latest_session)
-
-    stale_tickers=[]
-    if market_data_date is not None:
-        stale_tickers=[
-            t for t in universe.ticker.tolist()
-            if t not in latest_session or latest_session[t].get("date") != market_data_date
-        ]
-    stale_set=set(stale_tickers)
-    batch_requested=len(universe); batch_received=len(data)
-
-    if market_data_date is not None:
-        st.success(f"📅 今回のランキング基準日：{market_data_date} ｜ 最新60分足からOHLCVを日次集約して使用")
-    else:
-        st.error("🚨 最新営業日のOHLCVを確認できません。古い日足でランキングを作らないため処理を停止します。")
+    # v20: 最新営業日の「確定日足」だけを使う。60分足から終値を推定しない。
+    status.info(f"①-2 {market_label}の日足基準日とOHLCVを監査しています…")
+    market_data_date=expected_latest_jpx_session()
+    if market_data_date is None:
+        st.error("🚨 JPX取引カレンダーから直近の終了済み営業日を確定できません。ランキング生成を停止します。")
         st.stop()
 
-    coverage=(len(universe)-len(stale_tickers))/max(len(universe),1)*100
-    st.caption(f"最新営業日OHLCV確認率：{coverage:.1f}%（{len(universe)-len(stale_tickers):,}/{len(universe):,}銘柄）")
-    if stale_tickers:
-        st.warning(f"⚠️ {len(stale_tickers)}銘柄は {market_data_date} のOHLCVを確認できないため、今回のランキングから除外します。")
+    data, data_issues = audit_daily_dataset(data, universe.ticker.tolist(), market_data_date)
+    batch_requested=len(universe)
+    batch_received=len(data)
+    coverage=batch_received/max(batch_requested,1)*100
+
+    st.success(f"📅 ランキング基準日：{market_data_date} ｜ データ：確定日足のみ（60分足による終値推定なし）")
+    st.caption(f"✅ 日足品質ゲート通過：{batch_received:,}/{batch_requested:,}銘柄（{coverage:.1f}%）")
+
+    # 銘柄数が大幅に欠けるランキングは母集団が歪むため、出さない。
+    min_coverage=95.0 if mode.startswith(("📘","🧪","📕")) else 90.0
+    if coverage < min_coverage:
+        st.error(
+            f"🚨 最新営業日 {market_data_date} の確定日足確認率が {coverage:.1f}% と低いため、"
+            f"ランキング生成を停止しました（必要 {min_coverage:.0f}%以上）。"
+            " 古い価格を混ぜたランキングへのフォールバックは行いません。"
+        )
+        if not data_issues.empty:
+            st.dataframe(data_issues.head(50),use_container_width=True,hide_index=True)
+        st.stop()
+
+    if not data_issues.empty:
+        st.warning(
+            f"⚠️ {len(data_issues)}銘柄は日付不一致・OHLCV欠損等で除外しました。"
+            " 除外銘柄を古い価格のままランキングへ戻すことはありません。"
+        )
     rows=[]; total=len(universe)
 
     for i,row in universe.reset_index(drop=True).iterrows():
-        if row.ticker in stale_set: continue
         d=data.get(row.ticker)
         if d is not None:
             if mode.startswith("🏦"):
@@ -2696,7 +2752,7 @@ if st.session_state.run_scan_v10:
                 use_container_width=True,hide_index=True,
                 column_config={
                     "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
-                    "株価":st.column_config.NumberColumn("現在値",format="%.0f円"),
+                    "株価":st.column_config.NumberColumn("基準終値",format="%.0f円"),
                     "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
                     "年初来安値":st.column_config.NumberColumn("年初来安値",format="%.0f円"),
                     "年初来安値から%":st.column_config.NumberColumn("安値から",format="%+.2f%%"),
@@ -2793,11 +2849,11 @@ if st.session_state.run_scan_v10:
             st.stop()
 
         st.dataframe(
-            candidates[["順位","判定","銘柄","Yahoo!チャート","現在値","前日比%","急落-2.5%","25日線乖離%","25日線割れ","BBσ","BB-3σ","RCI9","RCI-90","底打ち条件数","材料確認","反転確認_独自","時価総額_億円","利確参考①","利確参考①根拠","利確参考②","利確参考②根拠"]],
+            candidates[["順位","判定","銘柄","Yahoo!チャート","基準終値","前日比%","急落-2.5%","25日線乖離%","25日線割れ","BBσ","BB-3σ","RCI9","RCI-90","底打ち条件数","材料確認","反転確認_独自","時価総額_億円","利確参考①","利確参考①根拠","利確参考②","利確参考②根拠"]],
             use_container_width=True,hide_index=True,
             column_config={
                 "Yahoo!チャート":st.column_config.LinkColumn("チャート",display_text="Yahoo! ↗"),
-                "現在値":st.column_config.NumberColumn("現在値",format="%.0f円"),
+                "基準終値":st.column_config.NumberColumn("基準終値",format="%.0f円"),
                 "前日比%":st.column_config.NumberColumn("前日比%",format="%+.2f%%"),
                 "25日線乖離%":st.column_config.NumberColumn("25日線乖離",format="%+.2f%%"),
                 "BBσ":st.column_config.NumberColumn("BB位置",format="%.2fσ"),
@@ -2940,7 +2996,7 @@ if st.session_state.run_scan_v10:
         })
 
         st.subheader("📊 実戦ランキング")
-        st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
+        st.caption("基準終値＝品質ゲートを通過した直近終了済み営業日の確定日足終値。リアルタイム株価ではありません。前日比・移動平均・ブレイク判定・注文参考値はすべて同じ基準日のOHLCVから計算します。")
 
         # v19.7 データ鮮度監査
         if "データ最終日" in tech.columns:
@@ -2980,7 +3036,7 @@ if st.session_state.run_scan_v10:
                     ["🔥ブレイク準備3条件", "○" if diag.get("ブレイク準備3条件") else "×"],
                 ], columns=["確認項目","結果"])
                 st.dataframe(detail, use_container_width=True, hide_index=True)
-                st.caption("個別再取得株価も日足終値ベースで、リアルタイム株価ではありません。日中の現在値と一致しない場合があります。")
+                st.caption("個別再取得株価も日足終値ベースで、リアルタイム株価ではありません。日中の基準終値と一致しない場合があります。")
         st.dataframe(
             safe_columns(tech.head(100), ["順位","実戦優先度","銘柄","Yahoo!チャート","株価","前日比","前日比%","短期総合スコア","セットアップ","ルール評価","注文種類","買い逆指値発動価格表示","発動後買い指値表示","損切り逆指値発動価格表示","発動後売り指値表示","利確目安①表示","RR","決算警告"]),
             use_container_width=True,
