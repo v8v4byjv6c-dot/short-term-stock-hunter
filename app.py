@@ -12,7 +12,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="短期上昇株ハンター v19.6.3",
+    page_title="短期上昇株ハンター v19.7",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -330,7 +330,7 @@ def select_market_universe(all_u, market):
 @st.cache_data(ttl=300, show_spinner=False)
 def download_batch(tickers, period):
     """
-    v19.6.3: 全対象を1回の yf.download() で取得。
+    v19.7: 全対象を1回の yf.download() で取得。
     100銘柄ずつの逐次16回通信を廃止し、取得フェーズの長時間化を防ぐ。
     repair=False: repair=True は追加の価格修復処理を伴い大規模一括取得では重いため無効。
     """
@@ -371,6 +371,112 @@ def download_batch(tickers, period):
         pass
     return out
 
+@st.cache_data(ttl=300, show_spinner=False)
+def download_latest_session(tickers):
+    """
+    v19.7:
+    日足が1営業日遅れるケースへの対策。
+    60分足をまとめて取得し、銘柄ごとに最新セッションのOHLCVへ集約する。
+    日足履歴は移動平均等の長期計算用、最新セッションは当日OHLCV補完用として分離する。
+    """
+    tickers=list(dict.fromkeys(tickers))
+    result={}
+    if not tickers:
+        return result
+    try:
+        x=yf.download(
+            tickers, period="5d", interval="60m",
+            group_by="ticker", auto_adjust=False, repair=False,
+            prepost=False, progress=False, threads=True, timeout=15
+        )
+        if x is None or x.empty:
+            return result
+
+        def aggregate_one(df):
+            if df is None or df.empty:
+                return None
+            need=[z for z in ["Open","High","Low","Close","Volume"] if z in df.columns]
+            if len(need)<5:
+                return None
+            q=df[need].dropna(subset=["Close"]).copy()
+            if q.empty:
+                return None
+            ix=pd.to_datetime(q.index)
+            try:
+                if ix.tz is not None:
+                    ix=ix.tz_convert("Asia/Tokyo").tz_localize(None)
+            except Exception:
+                try: ix=ix.tz_localize(None)
+                except Exception: pass
+            q.index=ix
+            session_date=q.index[-1].date()
+            day=q[q.index.date==session_date]
+            if day.empty:
+                return None
+            return {
+                "date":session_date,
+                "Open":float(day.Open.dropna().iloc[0]),
+                "High":float(day.High.max()),
+                "Low":float(day.Low.min()),
+                "Close":float(day.Close.dropna().iloc[-1]),
+                "Volume":float(day.Volume.fillna(0).sum()),
+            }
+
+        if len(tickers)==1 and not isinstance(x.columns,pd.MultiIndex):
+            a=aggregate_one(x)
+            if a: result[tickers[0]]=a
+        elif isinstance(x.columns,pd.MultiIndex):
+            l0=set(x.columns.get_level_values(0)); l1=set(x.columns.get_level_values(1))
+            if any(t in l0 for t in tickers):
+                for t in tickers:
+                    if t in l0:
+                        a=aggregate_one(x[t])
+                        if a: result[t]=a
+            else:
+                for t in tickers:
+                    if t in l1:
+                        a=aggregate_one(x.xs(t,axis=1,level=1))
+                        if a: result[t]=a
+    except Exception:
+        pass
+    return result
+
+
+def merge_latest_session(data, latest):
+    """最新60分足から作った日次OHLCVを日足履歴へ上書き/追加する。"""
+    merged=dict(data)
+    for t,a in latest.items():
+        d=merged.get(t)
+        if d is None or d.empty:
+            continue
+        q=d.copy()
+        if isinstance(q.columns,pd.MultiIndex):
+            q.columns=q.columns.get_level_values(0)
+        q.index=pd.to_datetime(q.index)
+        try:
+            if q.index.tz is not None: q.index=q.index.tz_localize(None)
+        except Exception: pass
+        dt=pd.Timestamp(a["date"])
+        for col in ["Open","High","Low","Close","Volume"]:
+            if col not in q.columns: q[col]=np.nan
+        q.loc[dt,["Open","High","Low","Close","Volume"]]=[
+            a["Open"],a["High"],a["Low"],a["Close"],a["Volume"]
+        ]
+        q=q.sort_index()
+        q=q[~q.index.duplicated(keep="last")]
+        merged[t]=q
+    return merged
+
+
+def latest_session_consensus(latest):
+    """最新セッション日を多数決で決める。指数日足そのものを基準日にしない。"""
+    if not latest:
+        return None
+    dates=pd.Series([v["date"] for v in latest.values()])
+    if dates.empty:
+        return None
+    return dates.value_counts().index[0]
+
 @st.cache_data(ttl=120, show_spinner=False)
 def latest_jp_market_date():
     try:
@@ -385,7 +491,7 @@ def _frame_last_date(d):
 
 def refresh_lagging_tickers(data,tickers,market_date):
     """
-    v19.6.3: 高速版。
+    v19.7: 高速版。
     全銘柄の個別再取得は行わない。一括取得結果の日付だけ監査し、
     市場基準日より古い銘柄を返す。古い銘柄はランキングから除外する。
     """
@@ -544,7 +650,7 @@ def technical_scan(d, slope_days, max_dev, breakout_days, a_stop_buffer_pct, buy
 
 
 # ------------------------------------------------------------
-# v19.6.3 銘柄診断・データ鮮度
+# v19.7 銘柄診断・データ鮮度
 # ------------------------------------------------------------
 def business_day_age(last_date):
     """今日までの平日ベースの概算経過日数。祝日は考慮しないため警告用の目安。"""
@@ -1415,13 +1521,13 @@ def mode_cache_key(mode_name, selected_markets):
 
 def get_mode_cache(mode_name, selected_markets):
     key = mode_cache_key(mode_name, selected_markets)
-    return st.session_state.get("scan_cache_v1963", {}).get(key)
+    return st.session_state.get("scan_cache_v197", {}).get(key)
 
 def set_mode_cache(mode_name, selected_markets, payload):
-    if "scan_cache_v1963" not in st.session_state:
-        st.session_state.scan_cache_v1963 = {}
+    if "scan_cache_v197" not in st.session_state:
+        st.session_state.scan_cache_v197 = {}
     key = mode_cache_key(mode_name, selected_markets)
-    st.session_state.scan_cache_v1963[key] = payload
+    st.session_state.scan_cache_v197[key] = payload
 
 def cache_age_text(ts):
     if ts is None:
@@ -2002,7 +2108,7 @@ def ai_scores(r):
     })
 
 
-st.title("🎯 短期上昇株ハンター v19.6.3")
+st.title("🎯 短期上昇株ハンター v19.7")
 st.write("同じURLで、短期・長期ランキングに加えて **🔎 保有銘柄の個別分析と管理** まで行えます。")
 
 mode = st.radio(
@@ -2200,8 +2306,8 @@ if "selected_markets_v12" not in st.session_state:
     st.session_state.selected_markets_v12 = ["プライム"]
 if "run_scan_v10" not in st.session_state:
     st.session_state.run_scan_v10 = False
-if "scan_cache_v1963" not in st.session_state:
-    st.session_state.scan_cache_v1963 = {}
+if "scan_cache_v197" not in st.session_state:
+    st.session_state.scan_cache_v197 = {}
 if "holdings_v18" not in st.session_state:
     st.session_state.holdings_v18 = []
 if "last_individual_v18" not in st.session_state:
@@ -2369,13 +2475,14 @@ btn1, btn2 = st.columns([4,1])
 with btn1:
     if st.button(f"🚀 {market_label}をスキャン", type="primary", use_container_width=True, disabled=not selected_markets):
         download_batch.clear()
+        download_latest_session.clear()
         latest_jp_market_date.clear()
         fetch_ticker_diagnostic_data.clear()
         st.session_state.run_scan_v10=True
 with btn2:
     if st.button("🗑️ 保持結果を削除", use_container_width=True, disabled=cache_payload is None):
         key = mode_cache_key(mode, selected_markets)
-        st.session_state.scan_cache_v1963.pop(key, None)
+        st.session_state.scan_cache_v197.pop(key, None)
         cache_payload = None
 
 if cache_payload is not None and not st.session_state.run_scan_v10:
@@ -2451,18 +2558,34 @@ if st.session_state.run_scan_v10:
     status=st.empty()
     progress=st.progress(0)
     status.info(f"① {market_label}の株価データを取得しています…")
-    st.caption("⚡ v19.6.3：全銘柄の個別再取得を廃止。一括取得＋鮮度監査で高速化しています。")
+    st.caption("⚡ v19.7：全銘柄の個別再取得を廃止。一括取得＋鮮度監査で高速化しています。")
     data=download_batch(universe.ticker.tolist(),period)
-    market_data_date=latest_jp_market_date()
-    data,stale_tickers=refresh_lagging_tickers(data,universe.ticker.tolist(),market_data_date)
+
+    # v19.7: 日足の更新待ちに依存せず、最新60分足を最新営業日のOHLCVへ集約して補完
+    status.info(f"①-2 {market_label}の最新営業日OHLCVを確認しています…")
+    latest_session=download_latest_session(universe.ticker.tolist())
+    market_data_date=latest_session_consensus(latest_session)
+    data=merge_latest_session(data,latest_session)
+
+    stale_tickers=[]
+    if market_data_date is not None:
+        stale_tickers=[
+            t for t in universe.ticker.tolist()
+            if t not in latest_session or latest_session[t].get("date") != market_data_date
+        ]
     stale_set=set(stale_tickers)
     batch_requested=len(universe); batch_received=len(data)
+
     if market_data_date is not None:
-        st.info(f"📅 今回のランキング基準日：{market_data_date}（日経平均の日足最終日）")
+        st.success(f"📅 今回のランキング基準日：{market_data_date} ｜ 最新60分足からOHLCVを日次集約して使用")
     else:
-        st.warning("⚠️ 日本市場の最新日を確認できません。ランキング基準日の保証ができません。")
+        st.error("🚨 最新営業日のOHLCVを確認できません。古い日足でランキングを作らないため処理を停止します。")
+        st.stop()
+
+    coverage=(len(universe)-len(stale_tickers))/max(len(universe),1)*100
+    st.caption(f"最新営業日OHLCV確認率：{coverage:.1f}%（{len(universe)-len(stale_tickers):,}/{len(universe):,}銘柄）")
     if stale_tickers:
-        st.error(f"⚠️ {len(stale_tickers)}銘柄の日足が市場基準日 {market_data_date} より古いため、古い価格で順位付けせず今回のランキングから除外します。全銘柄の個別再取得は行いません。")
+        st.warning(f"⚠️ {len(stale_tickers)}銘柄は {market_data_date} のOHLCVを確認できないため、今回のランキングから除外します。")
     rows=[]; total=len(universe)
 
     for i,row in universe.reset_index(drop=True).iterrows():
@@ -2819,7 +2942,7 @@ if st.session_state.run_scan_v10:
         st.subheader("📊 実戦ランキング")
         st.caption("現在値 → 前日比 → 評価 → 楽天証券の買い注文 → 損切り → 利確 → RR。前日比は最新日足と1本前の日足の比較で、リアルタイム配信値ではありません。")
 
-        # v19.6.3 データ鮮度監査
+        # v19.7 データ鮮度監査
         if "データ最終日" in tech.columns:
             age_series = tech["データ最終日"].apply(business_day_age)
             stale_count = int((age_series.fillna(999) >= 2).sum())
